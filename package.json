@@ -1,0 +1,50 @@
+{
+  "name": "meno-astro",
+  "version": "0.1.25",
+  "type": "module",
+  "description": "Meno-Astro: runtime helpers + the round-trippable .astro dialect (emit/parse) that lets Meno use Astro files as a source-of-truth format.",
+  "license": "MIT",
+  "author": "Meno <mac@meno.so>",
+  "homepage": "https://github.com/meno-so/meno-astro",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/meno-so/meno-astro.git"
+  },
+  "keywords": [
+    "astro-component",
+    "astro-integration",
+    "withastro"
+  ],
+  "exports": {
+    ".": "./lib/index.ts",
+    "./dialect": "./lib/dialect/index.ts",
+    "./integration": "./lib/integration/index.ts",
+    "./components": "./lib/components/index.ts",
+    "./components/LocaleRoute.astro": "./lib/components/LocaleRoute.astro",
+    "./runtime/localeMiddleware": "./lib/runtime/localeMiddleware.ts"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "build": "node scripts/build-for-publish.mjs",
+    "prepublishOnly": "node scripts/build-for-publish.mjs",
+    "postpublish": "node scripts/restore-package.mjs"
+  },
+  "peerDependencies": {
+    "astro": ">=4.0.0"
+  },
+  "dependencies": {
+    "meno-core": "^1.0.54"
+  },
+  "devDependencies": {
+    "bun-types": "^1.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.3.0",
+    "astro": "^6.0.0",
+    "happy-dom": "^20.0.0"
+  }
+}

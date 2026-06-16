@@ -1,0 +1,63 @@
+---
+/**
+ * Link.astro — the runtime component emitted for `{ type: "link" }` nodes
+ * (see dialect/emit/emitNode.ts:renderLink). The emitter passes `href` (usually a
+ * resolved string — via a `{{…}}` template, an `i18n(...)`, or an `href(...)` call), an
+ * optional `class`, plus any other HTML attributes, and the link text/children as a slot.
+ *
+ * `href` is normally a string, but a `{{link}}` template that binds a whole link prop
+ * (`{ href, target? }`) emits `href={link}` — so the value reaching us can be the link
+ * OBJECT, not its URL. meno-core flattens that to the URL at render
+ * (client/templateEngine.ts: unwraps `processedValue.href`, even when nested, and lifts
+ * `target`). Astro's `<a>` needs a string, so we mirror that here: a string href passes
+ * through; an object href is flattened to its (possibly nested) `.href`, and a `target`
+ * found on the object is applied (an explicitly-passed `target` attribute still wins).
+ *
+ * The flattened href is then **localized to the active render locale** (`localizeHref`):
+ * authored hrefs are default-locale paths, so on a `/pl/…` render an internal `/about`
+ * becomes `/pl/o-nas` (slug-translated) — SSR `localizeHref` parity. External hrefs and
+ * default-locale renders pass through untouched.
+ *
+ * The class is run through `linkClass`, which applies the `link` UA reset — meno-core's
+ * `.olink` (`display:block; text-decoration:none; color:inherit`), expressed as the utilities
+ * `block no-underline text-inherit`. This is INTRINSIC to every `<Link>` (the meno-astro mirror
+ * of meno-core seeding `['olink']` on every link node): no per-node marker in the source, so it
+ * applies to all existing projects with no re-conversion. It's conflict-aware — a reset utility
+ * is kept only when the link's own classes don't already set that property (so `display:flex`
+ * drops `block`, an authored underline drops `no-underline`, etc.).
+ */
+import { localizeHref, linkClass } from 'meno-astro';
+
+interface Props {
+  href?: unknown;
+  class?: string;
+  [attr: string]: unknown;
+}
+
+/**
+ * Flatten a link href to `{ href, target }`. A bare string → that URL. A link object
+ * `{ href, target? }` → its URL, unwrapping nested `href` wrappers (e.g. the
+ * `{ href: { href: "/x" } }` shape meno-core guards against in double-wrapped list
+ * templates) and capturing the outermost `target`. Anything unresolvable → no href.
+ */
+function flattenHref(value: unknown): { href?: string; target?: string } {
+  if (value == null) return {};
+  if (typeof value === 'string') return { href: value };
+  let v: unknown = value;
+  let target: string | undefined;
+  while (v && typeof v === 'object' && 'href' in (v as Record<string, unknown>)) {
+    const obj = v as { href?: unknown; target?: unknown };
+    if (target === undefined && typeof obj.target === 'string') target = obj.target;
+    v = obj.href;
+  }
+  return { href: typeof v === 'string' ? v : undefined, target };
+}
+
+const { href: rawHref, class: className, ...rest } = Astro.props;
+const { href: flatHref, target } = flattenHref(rawHref);
+// Internal hrefs are authored as default-locale paths — rewrite for the active locale.
+const href = localizeHref(flatHref) as string | undefined;
+// An explicit `target` attribute (in `rest`) wins over one lifted from the link object.
+const attrs = target !== undefined && rest.target === undefined ? { ...rest, target } : rest;
+---
+<a href={href} class={linkClass(className)} {...attrs}><slot /></a>

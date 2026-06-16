@@ -1,0 +1,72 @@
+---
+/**
+ * LocaleList.astro — the locale switcher (`{ type: "locale-list" }` nodes;
+ * see dialect/emit/emitNode.ts:renderLocaleList).
+ *
+ * Renders one link per configured locale, pointing at the *current page* in that locale.
+ * Links are **slug-translated** through the project's slug map (`loadSlugMappings` +
+ * meno-core's slug translator — the same data the injected locale route serves), so a
+ * page with `meta.slugs: { en: "about", pl: "o-nas" }` links `/pl/o-nas`, not a naive
+ * `/pl/about` prefix swap; paths the map doesn't know degrade to the prefix swap. The
+ * link for the active locale (`Astro.currentLocale`) is marked `aria-current="true"` and
+ * given an `is-active` class so the page can style it.
+ *
+ * The locale set comes from the project's i18n config (`loadI18nConfig(process.cwd())` —
+ * the same config the middleware/integration use), so this stays in sync with Astro's
+ * configured locales. Display label uses each locale's `nativeName` (its public-facing
+ * name, e.g. "Polski"), falling back to the code.
+ *
+ * Props mirror the emitter: `class`, `showCurrent` (include the active locale's link;
+ * default true), `displayType`, and pre-resolved `style`/`itemStyle`/`activeItemStyle`
+ * class strings. They are applied where present; unknown extras are ignored.
+ */
+import { loadI18nConfig, loadSlugMappings, localeListItems } from 'meno-astro';
+
+interface Props {
+  class?: string;
+  showCurrent?: boolean;
+  displayType?: string;
+  style?: string;
+  itemStyle?: string;
+  activeItemStyle?: string;
+}
+
+const {
+  class: className = '',
+  showCurrent = true,
+  style = '',
+  itemStyle = '',
+  activeItemStyle = '',
+} = Astro.props;
+
+const config = loadI18nConfig(process.cwd());
+const current = Astro.currentLocale ?? config.defaultLocale;
+
+// Slug-translated links: each locale's href is the *current page* under that locale's
+// slug (`/pl/o-nas`), resolved through the project slug map. Unknown paths degrade to
+// the locale-prefix swap (translatePath's no-entry fallback).
+const items = localeListItems(
+  Astro.url?.pathname ?? '/',
+  current,
+  config,
+  loadSlugMappings(process.cwd()),
+  showCurrent,
+);
+---
+<ul class={[style, className].filter(Boolean).join(' ')} data-locale-list>
+  {items.map(({ href, label, langTag, isCurrent }) => (
+    <li>
+      <a
+        href={href}
+        hreflang={langTag}
+        lang={langTag}
+        aria-current={isCurrent ? 'true' : undefined}
+        class={[itemStyle, isCurrent ? activeItemStyle : '', isCurrent ? 'is-active' : '']
+          .filter(Boolean)
+          .join(' ')}
+      >
+        {label}
+      </a>
+    </li>
+  ))}
+</ul>

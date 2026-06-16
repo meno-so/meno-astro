@@ -1,0 +1,36 @@
+---
+/**
+ * Embed.astro — the runtime component emitted for `{ type: "embed" }` nodes
+ * (see dialect/emit/emitNode.ts:renderEmbed). The emitter passes `html` (a raw HTML
+ * string), an optional `class`, and any other attributes.
+ *
+ * Minimal but correct: inject the raw `html` verbatim — except internal `<a href>`s,
+ * which are rewritten to the active render locale (`localizeRichTextLinks`, the SSR
+ * rich-text parity). When a wrapper is needed (a `class` or extra attributes were
+ * supplied) we wrap in a `<div>` carrying them; otherwise we emit the HTML bare via a
+ * `<Fragment>` so no extra element is introduced.
+ */
+import { richText } from 'meno-astro';
+
+interface Props {
+  html?: unknown; // HTML string, a TipTap doc, or a { __richtext__, … } marker
+  class?: string;
+  [attr: string]: unknown;
+}
+
+const { html: rawHtml = '', class: className, ...rest } = Astro.props;
+
+// CMS rich-text fields are stored as TipTap JSON, so `<Embed html={cms.content}>`
+// receives an OBJECT on real items — without normalizing it, Astro's `set:html`
+// string-coerces it to "[object Object]". `richText` is the shared render pipeline
+// (resolve i18n wrapper → TipTap/marker → HTML → localize internal links); idempotent
+// on plain HTML strings, and handles a multi-locale `{ _i18n, en, pl }` value even when
+// the template binds `html={cms.content}` without an explicit `i18n()`.
+const html = richText(rawHtml);
+const hasWrapperAttrs = Boolean(className) || Object.keys(rest).length > 0;
+---
+{hasWrapperAttrs ? (
+  <div class={className} {...rest} set:html={html} />
+) : (
+  <Fragment set:html={html} />
+)}

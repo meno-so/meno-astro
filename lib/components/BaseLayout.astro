@@ -1,0 +1,222 @@
+---
+/**
+ * BaseLayout.astro — the page shell every emitted page wraps its body in
+ * (`<BaseLayout meta={meta}>…</BaseLayout>`; see dialect/emit/emitPage.ts).
+ *
+ * Responsibilities:
+ *   - `<html lang>` from Astro's resolved locale (the locale middleware also drives this
+ *     via Astro's native i18n routing); falls back to the project's default locale.
+ *   - `<head>` renders `meta.title` / `meta.description`, each **resolved through
+ *     `i18n()`** because they may be i18n values (`{ _i18n, en, pl }`). The per-render
+ *     locale context is already open here (the locale middleware wrapped this whole
+ *     render in `runWithLocale`), so `i18n()` resolves to the active locale.
+ *   - Hreflang alternates (`<link rel="alternate" hreflang>` per locale + `x-default`)
+ *     from the project slug map (`buildHreflangLinks`) — SSR `metaTagGenerator` parity;
+ *     omitted for single-locale projects and unroutable paths. The merged slug map
+ *     includes CMS items, so template pages advertise their per-locale item URLs too
+ *     (draft-hidden locales excluded). Absolute URLs when the project declares a
+ *     `siteUrl` (`loadSiteUrl`), relative otherwise.
+ *   - A `<link rel="canonical">` — siteUrl + the trailing-slash-normalized pathname —
+ *     when (and only when) the project declares a `siteUrl`, matching SSR's
+ *     metaTagGenerator (canonical only when given a url).
+ *   - `@font-face` rules + font `<link rel="preload">` tags in `<head>`, built from
+ *     `project.config.json`'s `fonts` (`loadFontCss`). These *define* the families any
+ *     `font-family: '…'` from the `style()` collector references — without them the font
+ *     files ship but never load. Parity with `meno-core`'s SSR (`htmlGenerator.ts`) and
+ *     JSON→Astro export (`build-astro.ts`), which emit the same.
+ *   - A base CSS reset in `<head>` (zeroes UA margins/padding, `box-sizing: border-box`,
+ *     button/img normalization) — the meno-astro counterpart of the SSR runtime's reset
+ *     in `meno-core`'s `htmlGenerator.ts`. Without it, pages fall back to browser defaults
+ *     (`body { margin: 8px }`, heading top/bottom margins). Wrapped in `@layer base` so any
+ *     component style from the `style()` collector always wins on the cascade.
+ *   - `<body><slot /></body>` — the page body.
+ *   - An inline `formHandlerScript` before `</body>` so `<Form submitHandler="fetch">`
+ *     submits via fetch (FormData → the form's `action`) and shows an inline
+ *     success/error message — parity with meno-core's SSR (`htmlGenerator.ts`, which
+ *     injects the same script). Self-gating: a no-op when the page has no fetch form.
+ *   - After the slot, drains the `style()` CSS collector into a `<style>` tag so the CSS
+ *     accumulated while rendering the page's nodes lands in the document.
+ *
+ * NOTE: the page body's own `i18n(...)` calls run in the page's render scope, not here —
+ * which is exactly why the *middleware* (not this layout) establishes the locale context.
+ * This layout only resolves the `meta` values it is handed.
+ */
+import {
+  i18n,
+  loadFontCss,
+  loadLibraries,
+  loadIconsConfig,
+  loadI18nConfig,
+  loadSiteUrl,
+  loadSlugMappings,
+  buildHreflangLinks,
+  normalizePathname,
+  formHandlerScript,
+  menoFilterScript,
+} from 'meno-astro';
+import type { MenoPageMeta } from 'meno-astro';
+// The project's global utility stylesheet, generated at build time by the meno()
+// integration (scans every style() → utility classes + prop-mapping variants). This
+// replaces the per-render style() collector (Astro renders <head> before the body, so
+// a collector can't reliably feed <head>).
+import 'virtual:meno-utilities.css';
+// The built utility sheet as a STRING (separate from the side-effect import above) — used
+// ONLY to mirror it as a real inline <style> in the play preview (see the dev-inline block
+// below). Reuses the integration's cached/rebuilt sheet, so it's not a per-render re-scan.
+import utilityCssInline from 'virtual:meno-utilities.css?inline';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+interface Props {
+  meta?: MenoPageMeta;
+}
+
+const { meta } = Astro.props;
+
+// Active locale: Astro's i18n routing answer, else the *project's* default locale (a
+// non-en default project must not fall back to "en"). Used for <html lang> + hreflang.
+const i18nConfig = loadI18nConfig(process.cwd());
+const lang = Astro.currentLocale ?? i18nConfig.defaultLocale;
+
+// The project's public origin (`siteUrl` in project.config.json; null when absent).
+// Drives the canonical link + absolute hreflang hrefs below — both degrade gracefully
+// without it (no canonical, relative hreflang), matching SSR's metaTagGenerator, which
+// only emits canonical/absolute URLs when handed a url/baseUrl.
+const siteUrl = loadSiteUrl(process.cwd());
+
+// Hreflang alternates — one <link rel="alternate"> per locale (langTag values) +
+// x-default → the default-locale path, resolved through the project slug map (pages +
+// CMS items — a CMS template page rendered at /blog/my-post advertises /pl/blog/moj-post).
+// With a siteUrl the hrefs are absolute (Google's recommendation for hreflang); without
+// one they stay relative. SSR parity (metaTagGenerator's hreflang block + baseUrl seam);
+// [] for single-locale projects and for paths the slug map can't route.
+const hreflangs = buildHreflangLinks(
+  Astro.url?.pathname ?? '/',
+  lang,
+  i18nConfig,
+  loadSlugMappings(process.cwd()),
+  siteUrl ?? undefined,
+);
+
+// Canonical URL — the current pathname on the site origin, trailing slash stripped
+// (root keeps its `/`): `/about/` and `/about` both canonicalize to
+// `https://…/about`, collapsing Astro's directory-format duplicates for crawlers.
+// Only with a siteUrl (a relative canonical is worse than none — SSR parity).
+const canonicalUrl = siteUrl ? `${siteUrl}${normalizePathname(Astro.url?.pathname ?? '/')}` : null;
+
+// meta.title / meta.description may be plain strings OR i18n values — resolve both through
+// i18n() (a non-i18n value passes through unchanged). The middleware-opened locale context
+// makes these resolve to the active locale.
+const title = i18n(meta?.title ?? '');
+const description = i18n(meta?.description ?? '');
+
+// Font assets from project.config.json's `fonts` (read at build/SSR time; cwd is the
+// project root during astro build/dev). The `@font-face` rules are what make any
+// `font-family: 'Inter'` declared via style() actually resolve — without them the font
+// files ship but the browser never maps/fetches them (it silently falls back). This is
+// the dialect twin's parity with meno-core's SSR + JSON→Astro export, both of which emit
+// the same @font-face + preloads. Empty strings when no fonts are configured.
+const { css: fontFaceCss, preloads: fontPreloads } = loadFontCss(process.cwd());
+
+// External JS/CSS libraries (global + component + this page's meta.libraries), merged and
+// rendered to <link>/<script>/inline <style> tags — the dialect twin of meno-core's SSR
+// (htmlGenerator). headCSS/headJS go in <head>; bodyEndJS goes before </body>. Read from
+// project.config.json at build/SSR time (cwd is the project root). Empty when none configured.
+const { headCSS, headJS, bodyEndJS } = loadLibraries(process.cwd(), meta);
+
+// Favicons from project.config.json's `icons` (the Studio "Icons" settings panel). Global
+// per-project (not per-page / not i18n), so read here once and emitted as native <link>
+// elements below — the dialect twin of meno-core's SSR favicon block (htmlGenerator.ts).
+// The hrefs resolve through the project's bridged `/icons/` asset dir (meno() integration).
+// When BOTH a default and a dark favicon are set, scope the default to the light scheme and
+// the dark one to the dark scheme so the browser swaps automatically (apple-touch-icon does
+// not honor prefers-color-scheme). Empty {} when none configured → no icon tags emitted.
+const icons = loadIconsConfig(process.cwd());
+const hasDarkFavicon = !!(icons.favicon && icons.faviconDark);
+
+// Base reset — mirrors the SSR runtime's reset (meno-core htmlGenerator.ts) so the Astro
+// format renders without leftover UA defaults (body margin, heading margins). The SSR reset's
+// `.olink` rule is NOT reproduced as a class here: meno-astro dissolves it into the SAME utility
+// classes the `style()` collector already emits — every link carries `block no-underline
+// text-inherit`, applied at render by the Link.astro runtime component (linkClass), conflict-aware
+// so the link's own `display`/`text-decoration`/`color` still win. The `.oem` embed reset stays
+// SSR-only for now — its `.oem > *` child rule has no utility form. `@layer base` keeps this below
+// every unlayered component style the collector emits, so components always win.
+const BASE_RESET_CSS = `@layer base {
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', sans-serif; }
+  button { background: none; border: none; padding: 0; font: inherit; cursor: pointer; outline: inherit; }
+  img { max-width: 100%; height: auto; }
+  picture { display: block; }
+}`;
+
+// --- Play-preview FOUC fix (dev play mode only) -----------------------------
+// The two Vite-PROCESSED sheets — the utility sheet (`virtual:meno-utilities.css`)
+// and `src/styles/theme.css` — are injected client-side by Vite's dev JS, so the
+// SSR HTML carries them as EMPTY <style> placeholders. A full-document navigation
+// in the play iframe therefore paints UNSTYLED for one frame (a visible CSS blink)
+// before that JS runs. (Production builds emit real CSS in <head>, so the live site
+// never blinks — this is a dev-only artifact.) Mirror both as REAL inline <style> so
+// the first paint after a navigation is already styled.
+//
+// Scoped to play dev (`import.meta.env.DEV` + `MENO_PLAY`): leaves plain `astro dev`
+// and the production build untouched (the imports above already cover those). The
+// inline tags carry a `data-vite-dev-id` containing the substrings the play-patch
+// sheet-swap keys on (`meno-utilities` / `styles/theme.css`), so an HMR style edit
+// keeps them fresh (applyPayloadSheets) and a patch re-fetch refreshes them
+// (syncSheets) — no stale CSS while editing. Vite's own injected copy lands on top
+// after load (identical content; harmless duplicate in dev).
+const inlineDevSheets = import.meta.env.DEV && process.env.MENO_PLAY === '1';
+let themeCssInline = '';
+if (inlineDevSheets) {
+  try {
+    themeCssInline = readFileSync(join(process.cwd(), 'src/styles/theme.css'), 'utf8');
+  } catch {
+    /* un-themed project / no theme.css → nothing to inline */
+  }
+}
+---
+<!doctype html>
+<html lang={lang}>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    {fontPreloads ? <Fragment set:html={fontPreloads} /> : null}
+    {fontFaceCss ? <style set:html={fontFaceCss}></style> : null}
+    <style set:html={BASE_RESET_CSS}></style>
+    {/* Author library CSS/JS — after the reset so library styles win the cascade. */}
+    {headCSS ? <Fragment set:html={headCSS} /> : null}
+    {headJS ? <Fragment set:html={headJS} /> : null}
+    {title ? <title>{title}</title> : null}
+    {description ? <meta name="description" content={String(description)} /> : null}
+    {/* Favicons (project.config.json `icons`). When a dark favicon is also set, the default
+        is scoped to the light scheme; otherwise it carries no media (`undefined` → omitted). */}
+    {icons.favicon ? <link rel="icon" href={icons.favicon} media={hasDarkFavicon ? '(prefers-color-scheme: light)' : undefined} /> : null}
+    {icons.faviconDark ? <link rel="icon" href={icons.faviconDark} media="(prefers-color-scheme: dark)" /> : null}
+    {icons.appleTouchIcon ? <link rel="apple-touch-icon" href={icons.appleTouchIcon} /> : null}
+    {canonicalUrl ? <link rel="canonical" href={canonicalUrl} /> : null}
+    {hreflangs.map(({ hreflang, href }) => <link rel="alternate" hreflang={hreflang} href={href} />)}
+    {/* Dev play only: real inline copies of the Vite-injected sheets so a navigation's
+        first paint is styled (see the inlineDevSheets note above). */}
+    {inlineDevSheets && themeCssInline ? (
+      <style data-vite-dev-id="meno-dev-inline:src/styles/theme.css" set:html={themeCssInline}></style>
+    ) : null}
+    {inlineDevSheets ? (
+      <style data-vite-dev-id="meno-dev-inline:virtual:meno-utilities.css" set:html={utilityCssInline}></style>
+    ) : null}
+  </head>
+  <body>
+    <slot />
+    {bodyEndJS ? <Fragment set:html={bodyEndJS} /> : null}
+    {/* Client form-submit handler for <Form submitHandler="fetch"> — parity with
+        meno-core's SSR (htmlGenerator injects formHandlerScript). Self-gating (no-op
+        without a fetch form on the page), so it's emitted unconditionally. is:inline
+        keeps Astro from bundling/hoisting the raw IIFE string. */}
+    <script is:inline set:html={formHandlerScript} />
+    {/* Client-side CMS filtering (MenoFilter) for [data-meno-filter] pages — parity with
+        meno-core's SSR (htmlGenerator injects menoFilterScript). Self-gating (its auto-init
+        queries [data-meno-filter] and no-ops when the page has none), so it's emitted
+        unconditionally. is:inline keeps Astro from bundling/hoisting the raw IIFE string. */}
+    <script is:inline set:html={menoFilterScript} />
+  </body>
+</html>
