@@ -10,6 +10,7 @@
     "type": "git",
     "url": "git+https://github.com/meno-so/meno-astro.git"
   },
+  "bugs": "https://github.com/meno-so/meno-astro/issues",
   "keywords": [
     "astro-component",
     "astro-integration",
