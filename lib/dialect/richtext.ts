@@ -35,6 +35,33 @@ export function isRichTextHtml(s: string): boolean {
   return RICH_TEXT_TAG_RE.test(s);
 }
 
+/**
+ * meno-core's raw-HTML sentinel (`shared/constants.ts RAW_HTML_PREFIX`). A legacy JSON
+ * project marks a string value that must render as REAL HTML by prefixing it with this
+ * comment — meno-core's renderer strips it and sets innerHTML. The meno-astro dialect has
+ * no such sentinel (rich text is `type:"rich-text"` + `set:html`), so the converter must
+ * translate it: strip the marker and route the payload through the rich-text path. Kept as
+ * a local literal (not imported from meno-core) so the dialect codec carries no runtime
+ * dependency on the core package. Without this the marker ships verbatim and the HTML after
+ * it gets escaped — e.g. a hero heading renders the literal text `<!--MENO_RAW_HTML-->Raise
+ * more.<br>…` instead of the formatted markup.
+ */
+export const RAW_HTML_PREFIX = '<!--MENO_RAW_HTML-->';
+
+/**
+ * True when a value is a string carrying the meno-core raw-HTML sentinel (see
+ * {@link RAW_HTML_PREFIX}). Returns a plain boolean (not a `s is string` type predicate) so a
+ * negated check on an already-`string` argument doesn't narrow the else-branch to `never`.
+ */
+export function hasRawHtmlPrefix(s: unknown): boolean {
+  return typeof s === 'string' && s.startsWith(RAW_HTML_PREFIX);
+}
+
+/** Drop a leading {@link RAW_HTML_PREFIX}; returns the input unchanged if absent. */
+export function stripRawHtmlPrefix(s: string): string {
+  return s.startsWith(RAW_HTML_PREFIX) ? s.slice(RAW_HTML_PREFIX.length) : s;
+}
+
 /** Strip the editor-only `data-meno-span="…"` attribute from every `<span>` opening tag. */
 export function stripMenoSpanMarker(html: string): string {
   return html.replace(/<span\b[^>]*>/gi, (tag) => tag.replace(/\s+data-meno-span="[^"]*"/gi, ''));

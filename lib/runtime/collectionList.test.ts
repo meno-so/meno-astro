@@ -1,14 +1,47 @@
 import { test, expect, describe, afterEach } from 'bun:test';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
-import { tmpdir } from 'os';
-import { join, dirname } from 'path';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
 import { getCollectionList, queryList } from './collectionList';
+// Parity: this runtime keeps a local filter/sort copy (to stay self-contained in
+// the published tarball); meno-core/shared/cmsQuery is the canonical source. This
+// import pins the two together so the copy can't silently drift (it once did — the
+// SSR remote path lost boolean sorting).
+import { applyCmsFilters, applyCmsSorting } from 'meno-core/shared';
 import { clearCmsSlugMappingsCache } from '../server/loadCmsSlugMappings';
 import { loadSlugMappings, clearSlugMappingsCache } from '../server/loadSlugMappings';
 import { loadI18nConfig } from '../server/loadI18nConfig';
 import { localizeHrefFor } from './localizeHref';
 
 const tmps: string[] = [];
+
+describe('queryList — parity with meno-core/shared/cmsQuery', () => {
+  const items = [
+    { _id: 'a', title: 'Alpha', views: 10, featured: true },
+    { _id: 'b', title: 'Beta', views: 30, featured: false },
+    { _id: 'c', title: 'Gamma', views: 20, featured: true },
+    { _id: 'd', title: 'Delta', views: 20, featured: false },
+  ];
+  const cases: { filter?: any; sort?: any }[] = [
+    { filter: { featured: true } },
+    { filter: { field: 'views', operator: 'gte', value: 20 } },
+    { sort: { field: 'views', order: 'desc' } },
+    { sort: { field: 'featured', order: 'desc' } }, // the boolean case that drifted
+    { sort: { field: 'featured', order: 'asc' } },
+    { filter: { field: 'views', operator: 'gte', value: 20 }, sort: [{ field: 'featured', order: 'desc' }] },
+  ];
+
+  for (const [i, q] of cases.entries()) {
+    test(`case ${i} matches canonical filter+sort`, () => {
+      const expected = q.sort
+        ? applyCmsSorting(q.filter ? applyCmsFilters(items, q.filter) : items, q.sort)
+        : q.filter
+          ? applyCmsFilters(items, q.filter)
+          : items;
+      expect(queryList(items, q).map((x) => x._id)).toEqual(expected.map((x) => x._id));
+    });
+  }
+});
 
 /** A scratch project with the given files (relPath → source; objects are JSON-stringified). */
 function projectWith(files: Record<string, string | object>): string {

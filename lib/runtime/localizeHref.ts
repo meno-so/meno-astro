@@ -91,12 +91,9 @@ export function localizeRichTextLinks(html: string): string {
   const ctx = getLocaleContext();
   if (!ctx?.locale || ctx.locale === ctx.config.defaultLocale) return html;
   const mappings = loadSlugMappings(process.cwd());
-  return html.replace(
-    /<a\b([^>]*?)href=(["'])([^"']*?)\2([^>]*?)>/gi,
-    (match, before, quote, href, after) => {
-      if (!isInternalHref(href)) return match;
-      const localized = localizeHrefFor(href, ctx.locale, ctx.config, mappings);
-      return localized === href ? match : `<a${before}href=${quote}${localized}${quote}${after}>`;
-    },
-  );
+  return html.replace(/<a\b([^>]*?)href=(["'])([^"']*?)\2([^>]*?)>/gi, (match, before, quote, href, after) => {
+    if (!isInternalHref(href)) return match;
+    const localized = localizeHrefFor(href, ctx.locale, ctx.config, mappings);
+    return localized === href ? match : `<a${before}href=${quote}${localized}${quote}${after}>`;
+  });
 }

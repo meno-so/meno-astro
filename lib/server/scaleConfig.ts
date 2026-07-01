@@ -17,8 +17,8 @@
  * the global singletons in would couple them to ambient state.
  */
 
-import { readFileSync } from 'fs';
-import { join } from 'path';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { normalizeBreakpointConfig, DEFAULT_BREAKPOINTS, DEFAULT_RESPONSIVE_SCALES } from 'meno-core/shared';
 import type { BreakpointConfig, BreakpointConfigInput, ResponsiveScales, BreakpointScales } from 'meno-core/shared';
 

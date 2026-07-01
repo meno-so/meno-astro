@@ -23,8 +23,8 @@
  * during `astro dev`/`build`) by the published BaseLayout, same contract as `loadFontCss`.
  */
 
-import { readFileSync, statSync } from 'fs';
-import { join } from 'path';
+import { readFileSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 
 /** Favicon hrefs from `project.config.json`'s `icons` object (all optional). */
 export interface IconsConfig {

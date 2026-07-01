@@ -17,6 +17,10 @@ export interface CmsMetaLike {
   id?: string;
   slugField?: string;
   urlPattern?: string;
+  /** Backing store: `'cms'` (file-backed, default) or `'sanity'` (read-only Sanity dataset). */
+  source?: 'cms' | 'sanity';
+  /** Sanity document `_type` (only when `source === 'sanity'`). */
+  documentType?: string;
   /** The collection schema's field definitions (only `type` is read here, for rich-text detection). */
   fields?: Record<string, { type?: string }>;
 }
@@ -72,8 +76,28 @@ export function cmsRouteRelPath(urlPattern: string | undefined): string {
  * emit-only: the parser recognizes and SKIPS it, regenerating it from `meta.cms`.
  */
 export function buildGetStaticPaths(cms: CmsMetaLike): string {
-  const collectionId = cms.id ?? '';
   const slugField = cms.slugField || 'slug';
+
+  // Sanity-backed template: fetch the document type via GROQ (getSanityData) instead of the
+  // content collection (getCollection) — no astro:content, no local content.config entry. Items
+  // are read-only (authored in Sanity). The Sanity slug type is `{ _type:'slug', current }`, but
+  // getSanityData already flattens it to the `current` string, so `item.<slugField>` is the slug.
+  if (cms.source === 'sanity') {
+    const documentType = cms.documentType ?? cms.id ?? '';
+    return [
+      `export async function getStaticPaths() {`,
+      `  const items = await getSanityData(${JSON.stringify(documentType)}, {}, Astro);`,
+      `  return items.map((item) => ({`,
+      `    params: { slug: item.${slugField} ?? item._id },`,
+      `    props: { cms: item },`,
+      `  }));`,
+      `}`,
+      ``,
+      `const { cms } = Astro.props;`,
+    ].join('\n');
+  }
+
+  const collectionId = cms.id ?? '';
   return [
     `export async function getStaticPaths() {`,
     `  const entries = await getCollection(${JSON.stringify(collectionId)});`,

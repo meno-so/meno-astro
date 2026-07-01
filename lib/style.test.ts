@@ -63,7 +63,7 @@ describe('style() — interactive', () => {
   test('interactive meta appends one deterministic class (for build-time :hover CSS)', () => {
     const base = style({ base: { color: '#000' } });
     const withHover = style({ base: { color: '#000' } }, undefined, hover);
-    expect(withHover.startsWith(base + ' ')).toBe(true);
+    expect(withHover.startsWith(`${base} `)).toBe(true);
     expect(withHover.split(' ').length).toBe(base.split(' ').length + 1);
     // Deterministic: identical inputs ⇒ identical class.
     expect(style({ base: { color: '#000' } }, undefined, hover)).toBe(withHover);

@@ -1,7 +1,7 @@
 import { test, expect, describe, afterEach } from 'bun:test';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from 'fs';
-import { tmpdir } from 'os';
-import { join, dirname } from 'path';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
 import { loadSlugMappings, has404Page, clearSlugMappingsCache } from './loadSlugMappings';
 
 const tmps: string[] = [];
@@ -35,9 +35,7 @@ describe('loadSlugMappings', () => {
         `{\n  title: { _i18n: true, en: "About Us", pl: "O nas" },\n  slugs: { en: "about", pl: "o-nas" }\n}`,
       ),
     });
-    expect(loadSlugMappings(root)).toEqual([
-      { pageId: 'about', slugs: { en: 'about', pl: 'o-nas' } },
-    ]);
+    expect(loadSlugMappings(root)).toEqual([{ pageId: 'about', slugs: { en: 'about', pl: 'o-nas' } }]);
   });
 
   test('pages without slugs get the SSR `_default` shape (index → "")', () => {
@@ -58,9 +56,7 @@ describe('loadSlugMappings', () => {
     const root = projectWith({
       'about.astro': pageWithMeta(`{ slugs: { pl: "o-nas", en: "about-us" } }`),
     });
-    expect(loadSlugMappings(root)).toEqual([
-      { pageId: 'about', slugs: { pl: 'o-nas', en: 'about' } },
-    ]);
+    expect(loadSlugMappings(root)).toEqual([{ pageId: 'about', slugs: { pl: 'o-nas', en: 'about' } }]);
   });
 
   test('default-locale override respects a non-en default from project.config.json', () => {
@@ -72,18 +68,14 @@ describe('loadSlugMappings', () => {
       JSON.stringify({ i18n: { defaultLocale: 'pl', locales: ['pl', 'en'] } }),
       'utf8',
     );
-    expect(loadSlugMappings(root)).toEqual([
-      { pageId: 'o-nas', slugs: { pl: 'o-nas', en: 'about' } },
-    ]);
+    expect(loadSlugMappings(root)).toEqual([{ pageId: 'o-nas', slugs: { pl: 'o-nas', en: 'about' } }]);
   });
 
   test('legacy `export const meta` pages are read too', () => {
     const root = projectWith({
       'about.astro': `---\nexport const meta = { slugs: { en: "about", pl: "o-nas" } };\n---\n<div />\n`,
     });
-    expect(loadSlugMappings(root)).toEqual([
-      { pageId: 'about', slugs: { en: 'about', pl: 'o-nas' } },
-    ]);
+    expect(loadSlugMappings(root)).toEqual([{ pageId: 'about', slugs: { en: 'about', pl: 'o-nas' } }]);
   });
 
   test('nested pages keep their full route path as pageId (and as the default slug)', () => {
@@ -92,9 +84,7 @@ describe('loadSlugMappings', () => {
     const root = projectWith({
       'docs/intro.astro': pageWithMeta(`{ slugs: { en: "intro", pl: "wstep" } }`),
     });
-    expect(loadSlugMappings(root)).toEqual([
-      { pageId: 'docs/intro', slugs: { en: 'docs/intro', pl: 'wstep' } },
-    ]);
+    expect(loadSlugMappings(root)).toEqual([{ pageId: 'docs/intro', slugs: { en: 'docs/intro', pl: 'wstep' } }]);
   });
 
   test('dynamic routes and error pages are excluded (CMS templates, 404/500)', () => {
@@ -162,8 +152,6 @@ describe('loadSlugMappings', () => {
     utimesSync(aboutPath, future, future);
     rmSync(join(root, 'src', 'pages', 'old.astro'));
 
-    expect(loadSlugMappings(root)).toEqual([
-      { pageId: 'about', slugs: { en: 'about', pl: 'o-firmie' } },
-    ]);
+    expect(loadSlugMappings(root)).toEqual([{ pageId: 'about', slugs: { en: 'about', pl: 'o-firmie' } }]);
   });
 });

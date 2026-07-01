@@ -1,7 +1,7 @@
 import { test, expect, describe, afterEach } from 'bun:test';
-import { mkdtempSync, writeFileSync, rmSync } from 'fs';
-import { tmpdir } from 'os';
-import { join } from 'path';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { loadSiteUrl } from './loadSiteUrl';
 
 const tmps: string[] = [];
@@ -20,24 +20,16 @@ afterEach(() => {
 
 describe('loadSiteUrl', () => {
   test('reads a configured siteUrl', () => {
-    expect(loadSiteUrl(projectWith({ siteUrl: 'https://example.com' }))).toBe(
-      'https://example.com',
-    );
+    expect(loadSiteUrl(projectWith({ siteUrl: 'https://example.com' }))).toBe('https://example.com');
   });
 
   test('trims trailing slashes (callers do `${siteUrl}${path}`)', () => {
-    expect(loadSiteUrl(projectWith({ siteUrl: 'https://example.com/' }))).toBe(
-      'https://example.com',
-    );
-    expect(loadSiteUrl(projectWith({ siteUrl: 'https://example.com//' }))).toBe(
-      'https://example.com',
-    );
+    expect(loadSiteUrl(projectWith({ siteUrl: 'https://example.com/' }))).toBe('https://example.com');
+    expect(loadSiteUrl(projectWith({ siteUrl: 'https://example.com//' }))).toBe('https://example.com');
   });
 
   test('trims surrounding whitespace', () => {
-    expect(loadSiteUrl(projectWith({ siteUrl: '  https://example.com/  ' }))).toBe(
-      'https://example.com',
-    );
+    expect(loadSiteUrl(projectWith({ siteUrl: '  https://example.com/  ' }))).toBe('https://example.com');
   });
 
   test('missing project.config.json -> null', () => {

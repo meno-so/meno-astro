@@ -3,11 +3,13 @@
  * JSX attribute/expression string back into the Meno model value it came from.
  */
 
-import { isSupportedTemplateExpression } from 'meno-core/shared';
+import { isSupportedTemplateExpression, splitVariantPrefix } from 'meno-core/shared';
+import { decodeVariantClass } from '../variantClass';
 import { parseLiteral, reverseDeadCmsGuard, reverseI18nWrap } from './parseLiteral';
 import { scanBalanced, splitTopLevel } from './scan';
 import { callArgsOf } from './callArgs';
 import { addMenoSpanMarker } from '../richtext';
+import { dedentCode } from '../normalize';
 import type { ParseContext } from './parseContext';
 
 /** A preserved arbitrary-JS expression the Meno model can't represent as a binding. */
@@ -16,9 +18,10 @@ export interface CodeMarker {
   expr: string;
 }
 
-/** Tag an arbitrary JS expression as a verbatim-code marker. */
+/** Tag an arbitrary JS expression as a verbatim-code marker (multi-line exprs are dedented to a
+ * canonical, round-trip-stable indentation — see dedentCode). */
 export function codeMarker(expr: string): CodeMarker {
-  return { _code: true, expr };
+  return { _code: true, expr: dedentCode(expr) };
 }
 
 /** Reverse `escapeBacktick` + `${expr}` interpolation: backtick content → Meno string.
@@ -31,15 +34,15 @@ export function reverseTemplate(content: string): string {
     const c = content[i];
     if (c === '\\') {
       const n = content[i + 1];
-      // escapeBacktick produced \\, \` and \${ — undo each (\$ leaves the following { literal).
-      out += n === '\\' ? '\\' : n === '`' ? '`' : n === '$' ? '$' : n;
+      // escapeBacktick produced \\, \`, \${, \n and \r — undo each (\$ leaves the following { literal).
+      out += n === '\\' ? '\\' : n === '`' ? '`' : n === '$' ? '$' : n === 'n' ? '\n' : n === 'r' ? '\r' : n;
       i += 2;
       continue;
     }
     if (c === '$' && content[i + 1] === '{') {
       const end = scanBalanced(content, i + 1);
       const inner = content.slice(i + 2, end - 1).trim();
-      out += '{{' + (reverseDeadCmsGuard(inner) ?? reverseI18nWrap(inner) ?? inner) + '}}';
+      out += `{{${reverseDeadCmsGuard(inner) ?? reverseI18nWrap(inner) ?? inner}}}`;
       i = end;
       continue;
     }
@@ -98,13 +101,13 @@ export function interpretExprValue(expr: string, ctx: ParseContext): unknown {
   }
   // href()/embedHtml() may carry a threaded `__props` arg after the literal mapping (the
   // emitter passes the host component's props). Take only the first top-level arg.
-  if (e.startsWith('href(')) return parseLiteral(splitTopLevel(callArgsOf(e), ',')[0]);
-  if (e.startsWith('embedHtml(')) return parseLiteral(splitTopLevel(callArgsOf(e), ',')[0]);
+  if (e.startsWith('href(')) return parseLiteral(splitTopLevel(callArgsOf(e), ',')[0] ?? '');
+  if (e.startsWith('embedHtml(')) return parseLiteral(splitTopLevel(callArgsOf(e), ',')[0] ?? '');
   // The CMS rich-text render wrap (`richTextWithComponents(cms.content, cmsComponents)`)
   // → the field binding `{{cms.content}}`; the trailing registry arg is emit-only plumbing
   // (re-derived from ctx.needsCmsComponents on emit). The single-arg `richText(<chain>)`
   // predecessor still reverses via reverseI18nWrap above, so older files keep parsing.
-  if (e.startsWith('richTextWithComponents(')) return parseLiteral(splitTopLevel(callArgsOf(e), ',')[0]);
+  if (e.startsWith('richTextWithComponents(')) return parseLiteral(splitTopLevel(callArgsOf(e), ',')[0] ?? '');
   // Backtick literal → Meno string. Re-add the editor-only `data-meno-span` that emit strips
   // from custom spans (no-op for non-rich-text backticks like `/p/${slug}`), so rich-text
   // values round-trip to canonical meno-core HTML. See `../richtext`.
@@ -121,7 +124,7 @@ export function interpretExprValue(expr: string, ctx: ParseContext): unknown {
   // attribute emits `i18n(cms.x) || undefined`) — so arbitrary `x || undefined` isn't mis-read.
   const guard = e.match(/^(.+?)\s*\|\|\s*undefined$/);
   if (guard) {
-    const inner = guard[1].trim();
+    const inner = (guard[1] ?? '').trim();
     const chain = reverseI18nWrap(inner);
     if (chain) return `{{${chain}}}`;
     if (isSupportedTemplateExpression(inner)) return `{{${inner}}}`;
@@ -159,13 +162,122 @@ export function interpretStyleCall(expr: string): {
   return out;
 }
 
+/**
+ * Reconstruct the `_mapping` style fragment from a `variants(props, { prop: { value: "classes" }})`
+ * call — the inverse of emitClassAttr's variant-table build. Each class decodes (classToStyle) to a
+ * CSS property + value and a breakpoint (its variant prefix), reassembling into responsive
+ * `{ bp: { cssProp: { _mapping, prop, values } } }`. Empty class entries (an option with no style)
+ * are restored into every mapping the prop drives. Always responsive-shaped.
+ */
+export function interpretVariantsCall(expr: string): Record<string, Record<string, unknown>> {
+  const tablePart = splitTopLevel(callArgsOf(expr), ',').find((p) => p.trimStart().startsWith('{'));
+  if (!tablePart) return {};
+  const table = parseLiteral(tablePart) as Record<string, Record<string, string>>;
+  const style: Record<string, Record<string, unknown>> = {};
+  type Mapping = { _mapping: true; prop: string; values: Record<string, string> };
+  for (const [propName, lookup] of Object.entries(table)) {
+    const emptyKeys: string[] = [];
+    const mappingsForProp: Mapping[] = [];
+    for (const [valueKey, classStr] of Object.entries(lookup)) {
+      const tokens = String(classStr)
+        .split(/\s+/)
+        .filter((t) => t);
+      if (tokens.length === 0) {
+        emptyKeys.push(valueKey);
+        continue;
+      }
+      for (const cls of tokens) {
+        const bp = splitVariantPrefix(cls).breakpoint || 'base';
+        const entry = decodeVariantClass(cls);
+        if (!entry) continue;
+        const bucket: Record<string, unknown> = style[bp] ?? {};
+        style[bp] = bucket;
+        const existing = bucket[entry.prop] as Mapping | undefined;
+        let mapping: Mapping;
+        if (existing && existing._mapping === true && existing.prop === propName) {
+          mapping = existing;
+        } else {
+          mapping = { _mapping: true, prop: propName, values: {} };
+          bucket[entry.prop] = mapping;
+        }
+        if (!mappingsForProp.includes(mapping)) mappingsForProp.push(mapping);
+        mapping.values[valueKey] = entry.value;
+      }
+    }
+    for (const valueKey of emptyKeys) for (const mapping of mappingsForProp) mapping.values[valueKey] = '';
+  }
+  return style;
+}
+
+/** Merge a reconstructed (responsive) variant fragment into a static style value (from `style()`). */
+function mergeVariantIntoStyle(staticStyle: unknown, variant: Record<string, Record<string, unknown>>): unknown {
+  const vKeys = Object.keys(variant);
+  if (vKeys.length === 0) return staticStyle;
+  const s = (staticStyle && typeof staticStyle === 'object' ? staticStyle : {}) as Record<string, unknown>;
+  const staticResponsive = 'base' in s || 'tablet' in s || 'mobile' in s;
+  const staticFlatNonEmpty = !staticResponsive && Object.keys(s).length > 0;
+  // Flat static + base-only variant → keep flat (merge mappings directly).
+  if (staticFlatNonEmpty && vKeys.length === 1 && vKeys[0] === 'base') return { ...s, ...variant.base };
+  const out: Record<string, Record<string, unknown>> = {};
+  if (staticResponsive) {
+    for (const [bp, bucket] of Object.entries(s)) {
+      if (bucket && typeof bucket === 'object') out[bp] = { ...(bucket as Record<string, unknown>) };
+    }
+  } else if (staticFlatNonEmpty) {
+    out.base = { ...s };
+  }
+  for (const [bp, bucket] of Object.entries(variant)) out[bp] = { ...(out[bp] || {}), ...bucket };
+  return out;
+}
+
+/**
+ * Interpret a node's class expression — `style(…)`, or the prop-variant forms `variants(…)` /
+ * `cx(style(…), variants(…))` — into `{ style, interactiveStyles, label, generateElementClass }`,
+ * reconstructing `_mapping` style values from the variant table.
+ */
+export function interpretClassExpr(raw: string): {
+  style?: unknown;
+  interactiveStyles?: unknown;
+  label?: unknown;
+  generateElementClass?: unknown;
+  /** A foreign static class folded into the expression — the component-root `cx("…", className)`
+   *  form carries the node's `attributes.class` as a bare string arg (caller lands it). */
+  staticClass?: string;
+} {
+  const r = raw.trimStart();
+  if (r.startsWith('cx(')) {
+    let base: ReturnType<typeof interpretStyleCall> = {};
+    let variant: Record<string, Record<string, unknown>> = {};
+    let staticClass: string | undefined;
+    for (const part of splitTopLevel(callArgsOf(r), ',')) {
+      const p = part.trimStart();
+      if (p.startsWith('style(')) base = interpretStyleCall(p);
+      else if (p.startsWith('variants(')) variant = interpretVariantsCall(p);
+      else if (p.startsWith('"')) {
+        // The component-structure-root instance-merge form folds the node's static class string in
+        // as a bare arg — `cx("p-[24px]", className)`. Recover it as the foreign class.
+        try {
+          staticClass = parseLiteral(p) as string;
+        } catch {
+          /* not a plain string literal — ignore */
+        }
+      }
+      // else: a bare identifier (`className` / `class`) is the instance-merge seam — emit-only,
+      // re-derived from the structure root every emit, so it is dropped on parse.
+    }
+    return { ...base, style: mergeVariantIntoStyle(base.style, variant), staticClass };
+  }
+  if (r.startsWith('variants(')) return { style: mergeVariantIntoStyle(undefined, interpretVariantsCall(r)) };
+  return interpretStyleCall(r);
+}
+
 /** Reverse an `if` condition expression back into a Meno `if` value. */
 export function reverseCondition(cond: string): boolean | string | unknown {
   const c = cond.trim();
   if (c === 'false') return false;
   if (c === 'true') return true;
   // `when(mapping[, __props])` — strip the threaded props arg, take the literal mapping.
-  if (c.startsWith('when(')) return parseLiteral(splitTopLevel(callArgsOf(c), ',')[0]);
+  if (c.startsWith('when(')) return parseLiteral(splitTopLevel(callArgsOf(c), ',')[0] ?? '');
   // A quoted string literal (emit of a plain-string `if`) → the string itself, not a
   // `{{…}}` binding (jsep would otherwise accept it as a Literal). Trailing content
   // (e.g. `"a" || x`) makes parseLiteral throw → fall through to the JS paths.

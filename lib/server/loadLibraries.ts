@@ -29,8 +29,8 @@
  * time, never in the browser.
  */
 
-import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
-import { join } from 'path';
+import { existsSync, readFileSync, readdirSync, statSync, type Dirent } from 'node:fs';
+import { join } from 'node:path';
 // Import from the `meno-core/shared` barrel (not a deep `./libraryLoader` path): the
 // published meno-core bundles shared modules into the barrel and does not emit
 // `dist/lib/shared/libraryLoader.js`, so the deep path would 404 in a consumer project.
@@ -79,9 +79,14 @@ function normalizeLibraries(raw: unknown): LibrariesConfig {
 function dedupeByUrl(libs: LibrariesConfig): LibrariesConfig {
   const seenJS = new Set<string>();
   const seenCSS = new Set<string>();
+  const keepUnseen = (seen: Set<string>) => (url: string) => {
+    if (seen.has(url)) return false;
+    seen.add(url);
+    return true;
+  };
   return {
-    js: (libs.js || []).filter((l) => (seenJS.has(l.url) ? false : (seenJS.add(l.url), true))),
-    css: (libs.css || []).filter((l) => (seenCSS.has(l.url) ? false : (seenCSS.add(l.url), true))),
+    js: (libs.js || []).filter((l) => keepUnseen(seenJS)(l.url)),
+    css: (libs.css || []).filter((l) => keepUnseen(seenCSS)(l.url)),
   };
 }
 
@@ -139,7 +144,7 @@ export function collectAstroComponentLibraries(projectRoot: string): LibrariesCo
   const seenCSS = new Set<string>();
 
   const visit = (d: string) => {
-    let entries;
+    let entries: Dirent[];
     try {
       entries = readdirSync(d, { withFileTypes: true });
     } catch {
@@ -209,7 +214,7 @@ export function loadLibraries(projectRoot: string, pageMeta?: PageLibrariesMeta)
     for (const css of filtered.css || []) {
       if (css.inline === false || !css.url.startsWith('/')) continue;
       try {
-        const filePath = join(projectRoot, css.url.split('?')[0].slice(1));
+        const filePath = join(projectRoot, (css.url.split('?')[0] ?? '').slice(1));
         if (filePath.startsWith(projectRoot)) {
           inlineContents.set(css.url, readFileSync(filePath, 'utf8'));
         }
@@ -218,8 +223,44 @@ export function loadLibraries(projectRoot: string, pageMeta?: PageLibrariesMeta)
       }
     }
 
-    return generateLibraryTags(filtered, inlineContents);
+    // --- Library load-order guarantee (meno-astro-specific) ---------------------
+    // The dialect emits each component's init JS as a plain INLINE <script> right where the
+    // component renders in the body (resolving its element via document.currentScript). A
+    // plain inline script runs the moment the parser reaches it — *during* parse. A library
+    // script that is body-end + `defer` (the JS default) runs only AFTER the whole document
+    // is parsed. So every component init runs BEFORE its library global is defined, the
+    // `typeof EmblaCarousel !== 'undefined'` guards short-circuit, and carousels/sliders are
+    // silently never created. (meno-core SSR escapes this because it collects ALL init JS into
+    // a single body-end script; the dialect keeps init inline per component, so the runtime
+    // must guarantee library globals exist before the body is parsed.)
+    //
+    // Fix: render DEFAULT classic library scripts as BLOCKING <head> scripts (no defer/async)
+    // — the parser halts to fetch+execute them before it reaches any body init script, so the
+    // global is defined in time. "Default" = a classic script (`type` not `module`) the author
+    // left at the defaults (no explicit `mode`, no explicit `position`) — exactly the
+    // auto-provisioned UMD-global case (embla, swiper, …) this bug is about. Any EXPLICIT
+    // author choice (`mode: 'async'`, `position: 'body-end'`, a module, …) is honored verbatim
+    // by generateLibraryTags — we don't second-guess an intentional load strategy.
+    const isDefaultClassic = (l: JSLibraryConfig) => l.type !== 'module' && !l.mode && !l.position;
+    const blockingJs = (filtered.js || []).filter(isDefaultClassic);
+    const restJs = (filtered.js || []).filter((l) => !isDefaultClassic(l));
+
+    const blockingHeadJS = blockingJs.map((l) => `<script src="${escapeAttr(l.url)}"></script>`).join('\n  ');
+
+    const rest = generateLibraryTags({ js: restJs, css: filtered.css }, inlineContents);
+
+    return {
+      headCSS: rest.headCSS,
+      // Blocking library scripts first, then any scripts the author explicitly placed in <head>.
+      headJS: [blockingHeadJS, rest.headJS].filter(Boolean).join('\n  '),
+      bodyEndJS: rest.bodyEndJS,
+    };
   } catch {
     return EMPTY;
   }
+}
+
+/** Escape HTML special characters in an attribute value (mirrors meno-core's libraryLoader). */
+function escapeAttr(str: string): string {
+  return str.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }

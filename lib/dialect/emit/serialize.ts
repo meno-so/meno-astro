@@ -21,6 +21,22 @@ const INDENT_STEP = 2;
 
 const IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 
+/**
+ * A pre-rendered JS expression to embed verbatim in an otherwise-literal value (e.g. a CMS
+ * `{{cms.title}}` meta binding emitted as the expression `i18n(cms.title)` so BaseLayout
+ * renders the resolved value, not the inert "{{cms.title}}" string). Rendered exactly as
+ * given — never quoted, escaped, or width-wrapped. The parser reads it back through
+ * `parseExprToken`/`parseBacktick`, so the binding round-trips to its `{{…}}` template.
+ */
+export class RawExpr {
+  constructor(public readonly code: string) {}
+}
+
+/** Wrap a pre-rendered expression so {@link serializeLiteral} embeds it verbatim. */
+export function rawExpr(code: string): RawExpr {
+  return new RawExpr(code);
+}
+
 /** Whether a key can be emitted unquoted as a JS object key. */
 export function isIdentifier(key: string): boolean {
   return IDENT_RE.test(key);
@@ -46,6 +62,7 @@ function definedEntries(obj: Record<string, unknown>): Array<[string, unknown]> 
 
 /** Always-inline rendering (never emits newlines). Used for fit-testing and for short values. */
 function renderInline(value: unknown): string {
+  if (value instanceof RawExpr) return value.code;
   if (value === null) return 'null';
   if (value === undefined) return 'undefined';
   switch (typeof value) {
@@ -58,11 +75,11 @@ function renderInline(value: unknown): string {
     case 'object': {
       if (Array.isArray(value)) {
         if (value.length === 0) return '[]';
-        return '[' + value.map(renderInline).join(', ') + ']';
+        return `[${value.map(renderInline).join(', ')}]`;
       }
       const entries = definedEntries(value as Record<string, unknown>);
       if (entries.length === 0) return '{}';
-      return '{ ' + entries.map(([k, v]) => `${renderKey(k)}: ${renderInline(v)}`).join(', ') + ' }';
+      return `{ ${entries.map(([k, v]) => `${renderKey(k)}: ${renderInline(v)}`).join(', ')} }`;
     }
     default:
       // functions/symbols/bigint are not part of the model
@@ -100,6 +117,9 @@ export function serializeLiteral(value: unknown, opts: SerializeOptions = {}): s
    * @param startCol   column where this value begins on the current line (for the inline-fit test)
    */
   const render = (v: unknown, contIndent: number, startCol: number): string => {
+    // A verbatim expression: emit as-is, never quoted/wrapped (short-circuit before the
+    // width logic, which would otherwise treat the RawExpr object as a `{ code }` literal).
+    if (v instanceof RawExpr) return v.code;
     // Primitives are always inline.
     if (v === null || typeof v !== 'object') return renderInline(v);
 
@@ -112,16 +132,16 @@ export function serializeLiteral(value: unknown, opts: SerializeOptions = {}): s
     if (Array.isArray(v)) {
       if (v.length === 0) return '[]';
       const items = v.map((item) => pad + render(item, contIndent + INDENT_STEP, contIndent + INDENT_STEP));
-      return '[\n' + items.join(',\n') + '\n' + closePad + ']';
+      return `[\n${items.join(',\n')}\n${closePad}]`;
     }
 
     const entries = definedEntries(v as Record<string, unknown>);
     if (entries.length === 0) return '{}';
     const lines = entries.map(([k, val]) => {
-      const prefix = pad + renderKey(k) + ': ';
+      const prefix = `${pad + renderKey(k)}: `;
       return prefix + render(val, contIndent + INDENT_STEP, prefix.length);
     });
-    return '{\n' + lines.join(',\n') + '\n' + closePad + '}';
+    return `{\n${lines.join(',\n')}\n${closePad}}`;
   };
 
   return render(value, baseIndent, startCol);

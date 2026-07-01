@@ -13,9 +13,10 @@
  * stylesheet that BaseLayout imports.
  */
 
-import { readdirSync, readFileSync, existsSync } from 'fs';
-import { join } from 'path';
+import { readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { parse } from '../dialect';
+import { isStateVariantClass, generateStateVariantCss, interactiveToTokens } from '../dialect/interactiveVariants';
 import {
   responsiveStylesToClasses,
   generateUtilityCSS,
@@ -25,7 +26,8 @@ import {
   DEFAULT_BREAKPOINTS,
 } from 'meno-core/shared';
 import type { BreakpointConfig, ResponsiveScales } from 'meno-core/shared';
-import type { StyleValue, StyleObject, InteractiveStyles } from 'meno-core/shared';
+import type { StyleValue, StyleObject, InteractiveStyles, InteractiveStyleRule } from 'meno-core/shared';
+import type { RemConversionConfig } from '../dialect/remConversion';
 import { computeClassName, resolveMappingsInStyle, NODE_RESET_STYLES } from '../runtime/style';
 import { templateVarName } from '../runtime/cssValue';
 
@@ -79,6 +81,21 @@ function collectClasses(style: unknown, into: Set<string>): void {
   }
 }
 
+/**
+ * Collect utility tokens from a literal class attribute. The class-string styling
+ * model (docs/meno-class-styling-migration.md) stores utility classes in
+ * `attributes.class`; harvest them so the build generates their CSS. Foreign
+ * library tokens (`swiper`) aren't Meno utilities — `generateUtilityCSS` yields no
+ * rule for them, so they're harmlessly skipped. Template values (`{{…}}`) are
+ * dynamic and bridged elsewhere, so skip the whole attribute when one is present.
+ */
+function collectClassAttr(attributes: unknown, into: Set<string>): void {
+  if (!attributes || typeof attributes !== 'object') return;
+  const cls = (attributes as Record<string, unknown>).class;
+  if (typeof cls !== 'string' || cls === '' || cls.includes('{{')) return;
+  for (const token of cls.split(/\s+/)) if (token) into.add(token);
+}
+
 /** Map of prop → its possible mapping-key values, across a style value's `_mapping`s. */
 function mappingPropValues(style: unknown, into: Map<string, Set<string>>): void {
   for (const [, bpStyle] of eachBpStyle(style)) {
@@ -114,20 +131,23 @@ function collectInteractiveCss(
   acc: { css: string; seen: Set<string> },
   breakpoints: BreakpointConfig,
   responsiveScales: ResponsiveScales | undefined,
+  remConfig: RemConversionConfig | undefined,
 ): void {
   if (!Array.isArray(interactive) || interactive.length === 0) return;
   const rules = interactive as InteractiveStyles;
   const propValues = new Map<string, Set<string>>();
   for (const r of rules) mappingPropValues((r as { style: StyleValue }).style, propValues);
   for (const assignment of cartesian(propValues)) {
-    const resolved = rules.map((r) => ({ ...r, style: resolveMappingsInStyle((r as any).style, assignment) }));
+    const resolved = rules.map((r) => ({
+      ...r,
+      style: resolveMappingsInStyle((r as { style: StyleValue }).style, assignment),
+    }));
     const cls = computeClassName({}, resolved as InteractiveStyles, label);
     if (acc.seen.has(cls)) continue;
     acc.seen.add(cls);
-    // responsiveScales is the 5th arg (after the remConfig slot) — applies the same
-    // per-breakpoint / clamp() scaling meno-core's SSR does (cssGeneration.ts).
-    acc.css +=
-      generateInteractiveCSS(cls, resolved as InteractiveStyles, breakpoints, undefined, responsiveScales) + '\n';
+    // remConfig is the 4th arg, responsiveScales the 5th — applies the same px→rem conversion
+    // and per-breakpoint / clamp() scaling meno-core's SSR does (cssGeneration.ts).
+    acc.css += `${generateInteractiveCSS(cls, resolved as InteractiveStyles, breakpoints, remConfig, responsiveScales)}\n`;
   }
 }
 
@@ -157,9 +177,15 @@ function walkModel(
   inter: { css: string; seen: Set<string> },
   breakpoints: BreakpointConfig,
   responsiveScales: ResponsiveScales | undefined,
+  remConfig: RemConversionConfig | undefined,
 ): void {
   visitModelNodes(node, (obj) => {
     if (obj.style) collectClasses(obj.style, classes);
+    collectClassAttr(obj.attributes, classes);
+    // A component INSTANCE carries its per-instance class override on `props.class`
+    // (`<Card class="p-[24px]" />`), which the runtime cx-merges over the component root's
+    // classes. Harvest it too, or the override renders on the element with no CSS rule behind it.
+    collectClassAttr(obj.props, classes);
     // A node-type UA reset (links: `block no-underline text-inherit`) is applied at render by the
     // Link.astro runtime component (linkClass), not from the model — so collect its rules here
     // unconditionally for every link node, else the classes ship with no CSS. Union (not merge):
@@ -167,14 +193,25 @@ function walkModel(
     // (linkClass drops the conflicting reset utility per CSS property).
     const reset = typeof obj.type === 'string' ? NODE_RESET_STYLES[obj.type] : undefined;
     if (reset) collectClasses(reset, classes);
-    if (obj.interactiveStyles)
-      collectInteractiveCss(
-        obj.interactiveStyles,
-        obj.label as string | undefined,
-        inter,
-        breakpoints,
-        responsiveScales,
-      );
+    if (obj.interactiveStyles) {
+      // Convertible interactive rules render via state-variant classes (`hover:bg-[#222]`) — the
+      // element's class string carries those tokens (emit lowered them; parse lifted them back into
+      // this `interactiveStyles`). Re-derive the SAME tokens so generateStateVariantCss emits CSS
+      // matching the element's classes. Non-convertible rules keep the hashed-class collectInteractiveCss.
+      const tokens = interactiveToTokens(obj.interactiveStyles as InteractiveStyleRule[]);
+      if (tokens) {
+        for (const t of tokens) classes.add(t);
+      } else {
+        collectInteractiveCss(
+          obj.interactiveStyles,
+          obj.label as string | undefined,
+          inter,
+          breakpoints,
+          responsiveScales,
+          remConfig,
+        );
+      }
+    }
   });
 }
 
@@ -195,6 +232,13 @@ export function collectModelClassTokens(model: unknown): Set<string> {
         out.add(t);
       }
     }
+    // Class-string styling: utility tokens stored in attributes.class are part of the node's
+    // rendered class list too. Harvest them so the play-patch stale-token diff retires class-
+    // string edits (otherwise an edit that drops p-[24px] would leave the live element styled).
+    collectClassAttr(obj.attributes, out);
+    // A component instance's per-instance override lives on `props.class` — harvest it too so a
+    // changed/removed instance override retires cleanly in play.
+    collectClassAttr(obj.props, out);
   });
   return out;
 }
@@ -214,7 +258,10 @@ export function collectNodeClassTokens(style: unknown, interactive: unknown, lab
     const propValues = new Map<string, Set<string>>();
     for (const r of rules) mappingPropValues((r as { style: StyleValue }).style, propValues);
     for (const assignment of cartesian(propValues)) {
-      const resolved = rules.map((r) => ({ ...r, style: resolveMappingsInStyle((r as any).style, assignment) }));
+      const resolved = rules.map((r) => ({
+        ...r,
+        style: resolveMappingsInStyle((r as { style: StyleValue }).style, assignment),
+      }));
       tokens.add(computeClassName({}, resolved as InteractiveStyles, label));
     }
   }
@@ -239,13 +286,18 @@ export interface UtilitySource {
  * `breakpoints` + `responsiveScales` (from the project's `project.config.json`, resolved
  * via {@link readScaleConfigSync}) drive the per-class responsive scaling — the same
  * `@media` / `clamp()` size scaling meno-core's SSR and design canvas apply — so the
- * sheet matches the canvas at every breakpoint. Both default so callers that don't scale
- * (tests, ad-hoc) keep their previous unscaled output.
+ * sheet matches the canvas at every breakpoint. `remConfig` (the project's "Convert px to
+ * rem" setting, resolved via {@link readRemConfigSync}) converts px declarations to rem —
+ * the same conversion meno-core's render path applies — so an Astro project honors the
+ * toggle. All default so callers that don't scale/convert (tests, ad-hoc) keep their
+ * previous output.
  */
 export function buildUtilityStylesheet(
   sources: Array<UtilitySource | string>,
   breakpoints: BreakpointConfig = DEFAULT_BREAKPOINTS,
   responsiveScales?: ResponsiveScales,
+  knownTokens?: ReadonlySet<string>,
+  remConfig?: RemConversionConfig,
 ): string {
   const classes = new Set<string>();
   const inter = { css: '', seen: new Set<string>() };
@@ -263,8 +315,19 @@ export function buildUtilityStylesheet(
       );
       continue;
     }
-    walkModel(model, classes, inter, breakpoints, responsiveScales);
+    walkModel(model, classes, inter, breakpoints, responsiveScales, remConfig);
   }
+  // State-variant classes (`hover:bg-[#222]`) aren't meno-core utilities — generateUtilityCSS
+  // can't parse them. Split them out and generate their `.<escaped>:hover { … }` rules separately
+  // (meno-astro-local, published-primitives-only — see dialect/interactiveVariants.ts); pass only
+  // the base utilities to meno-core.
+  const baseClasses = new Set<string>();
+  const variantClasses: string[] = [];
+  for (const c of classes) {
+    if (isStateVariantClass(c)) variantClasses.push(c);
+    else baseClasses.add(c);
+  }
+  const variant = generateStateVariantCss(variantClasses, remConfig);
   // Pass the classes property-sorted (shorthand before longhand). generateUtilityCSS sorts
   // its BASE rules itself, but the auto-responsive @media section emits in the set's
   // iteration order — and some published meno-core builds the play runtime installs DON'T
@@ -274,7 +337,7 @@ export function buildUtilityStylesheet(
   // the SSR canvas's render order, so the same project rendered correctly in select mode but
   // lost the longhand in Astro play. Sorting the input makes the @media cascade correct
   // regardless of the runtime core's internal ordering (a no-op when it already sorts).
-  const sorted = new Set(sortClassesByPropertyOrder(classes));
-  const utility = sorted.size ? generateUtilityCSS(sorted, breakpoints, responsiveScales) : '';
-  return [utility, inter.css].filter(Boolean).join('\n');
+  const sorted = new Set(sortClassesByPropertyOrder(baseClasses));
+  const utility = sorted.size ? generateUtilityCSS(sorted, breakpoints, responsiveScales, remConfig, knownTokens) : '';
+  return [utility, variant, inter.css].filter(Boolean).join('\n');
 }

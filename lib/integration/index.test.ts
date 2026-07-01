@@ -1,8 +1,8 @@
 import { test, expect, describe, afterEach } from 'bun:test';
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync, existsSync, readFileSync } from 'fs';
-import { tmpdir } from 'os';
-import { join } from 'path';
-import { pathToFileURL } from 'url';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, sep } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import meno, {
   toAstroI18nOptions,
   LOCALE_MIDDLEWARE_ENTRYPOINT,
@@ -17,8 +17,16 @@ import meno, {
   resolveAssetFile,
   copyAssetDirsToOutput,
   collectUtilitySources,
+  frameworkFsAllow,
+  adapterFactoryOptions,
   UTILITY_CSS_MODULE,
+  type MenoIntegration,
 } from './index';
+
+// `meno()` returns an array — the meno-astro integration plus any installed island-
+// framework renderers (Astro flattens it). These tests exercise the meno-astro
+// integration itself, so pull it out by name (typed so hook params keep inferring).
+const menoBase = (): MenoIntegration => (meno() as unknown as MenoIntegration[]).find((i) => i.name === 'meno-astro')!;
 import {
   PLAY_XRAY_BRIDGE_SCRIPT,
   PLAY_COMMENT_MODE_MESSAGE_TYPE,
@@ -101,8 +109,38 @@ describe('meno() integration', () => {
     return dir;
   }
 
+  /** A project root whose project.config.json is the given full object (for the Astro-config extras). */
+  function projectRootWithConfig(config: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'meno-integ-'));
+    tmps.push(dir);
+    writeFileSync(join(dir, 'project.config.json'), JSON.stringify(config), 'utf8');
+    return dir;
+  }
+
+  /** Run config:setup for `command`/play and return the single updateConfig payload. */
+  function runConfigSetup(root: string, command: 'dev' | 'build', play: boolean): Record<string, unknown> {
+    const updates: Record<string, unknown>[] = [];
+    const prev = process.env[MENO_PLAY_ENV];
+    if (play) process.env[MENO_PLAY_ENV] = '1';
+    else delete process.env[MENO_PLAY_ENV];
+    try {
+      menoBase().hooks['astro:config:setup']({
+        config: { root: pathToFileURL(`${root}/`) },
+        command,
+        updateConfig: (c) => updates.push(c),
+        addMiddleware: () => {},
+        injectScript: () => {},
+        addWatchFile: () => {},
+      });
+    } finally {
+      if (prev === undefined) delete process.env[MENO_PLAY_ENV];
+      else process.env[MENO_PLAY_ENV] = prev;
+    }
+    return updates[0]!;
+  }
+
   test('shape: name + config:setup and build:done hooks', () => {
-    const integ = meno();
+    const integ = menoBase();
     expect(integ.name).toBe('meno-astro');
     expect(typeof integ.hooks['astro:config:setup']).toBe('function');
     expect(typeof integ.hooks['astro:build:done']).toBe('function');
@@ -119,8 +157,8 @@ describe('meno() integration', () => {
 
     const updates: Record<string, unknown>[] = [];
     const middlewares: { entrypoint: string | URL; order: 'pre' | 'post' }[] = [];
-    meno().hooks['astro:config:setup']({
-      config: { root: pathToFileURL(root + '/') },
+    menoBase().hooks['astro:config:setup']({
+      config: { root: pathToFileURL(`${root}/`) },
       updateConfig: (c) => updates.push(c),
       addMiddleware: (m) => middlewares.push(m),
     });
@@ -140,6 +178,14 @@ describe('meno() integration', () => {
     expect((updates[0] as any).vite.optimizeDeps).toEqual({ exclude: ['meno-astro'] });
     expect((updates[0] as any).vite.ssr).toEqual({ noExternal: ['meno-astro'] });
 
+    // Island hydration chunks live in the play runtime's HOISTED workspace node_modules
+    // (outside the Vite root) — fs.allow must widen to reach them or `/@fs/…` 403s. The
+    // Vite root (project copy) is always present so the allow-list is never empty.
+    // (The resolved root carries a trailing slash from the file:// URL round-trip.)
+    const fsAllow = (updates[0] as any).vite.server.fs.allow as string[];
+    expect(Array.isArray(fsAllow)).toBe(true);
+    expect(fsAllow.some((p) => p.replace(/[\\/]$/, '') === root)).toBe(true);
+
     // (b) locale middleware injected, ordered before user middleware.
     expect(middlewares).toEqual([{ entrypoint: LOCALE_MIDDLEWARE_ENTRYPOINT, order: 'pre' }]);
   });
@@ -154,16 +200,45 @@ describe('meno() integration', () => {
     });
 
     const routes: { pattern: string; entrypoint: string | URL; prerender?: boolean }[] = [];
-    meno().hooks['astro:config:setup']({
-      config: { root: pathToFileURL(root + '/') },
+    menoBase().hooks['astro:config:setup']({
+      config: { root: pathToFileURL(`${root}/`) },
       updateConfig: () => {},
       addMiddleware: () => {},
       injectRoute: (r) => routes.push(r),
     });
 
-    expect(routes).toEqual([
-      { pattern: LOCALE_ROUTE_PATTERN, entrypoint: LOCALE_ROUTE_ENTRYPOINT, prerender: true },
-    ]);
+    expect(routes).toEqual([{ pattern: LOCALE_ROUTE_PATTERN, entrypoint: LOCALE_ROUTE_ENTRYPOINT, prerender: true }]);
+  });
+
+  test('output: static by default — no `output` forced into the Astro config', () => {
+    // meno() resolves the adapter from cwd (the repo, which has no SSR config), so the
+    // common case never sets output — Astro keeps its static default.
+    const root = projectRootWith({
+      defaultLocale: 'en',
+      locales: [{ code: 'en', name: 'English', nativeName: 'English', langTag: 'en-US' }],
+    });
+    const payload = runConfigSetup(root, 'build', false);
+    expect(payload.output).toBeUndefined();
+  });
+
+  test('SSR adapter not installed → graceful static fallback (output stays unset)', () => {
+    // A project asking for output: 'server' with an adapter that isn't in the runtime store
+    // must NOT force output: 'server' (that would hard-fail the build). Since this test env
+    // has no @astrojs/* adapter installed, loadAdapterIntegration returns null and output is
+    // never set — proving the fallback path.
+    const root = projectRootWithConfig({
+      i18n: {
+        defaultLocale: 'en',
+        locales: [{ code: 'en', name: 'English', nativeName: 'English', langTag: 'en-US' }],
+      },
+      output: 'server',
+      adapter: { name: 'node' },
+    });
+    const payload = runConfigSetup(root, 'build', false);
+    expect(payload.output).toBeUndefined();
+    // And meno() never appended a broken adapter integration.
+    const names = (meno() as unknown as { name: string }[]).map((i) => i.name);
+    expect(names).toContain('meno-astro');
   });
 
   test('single-locale project: locale route NOT injected (zero-cost no-op)', () => {
@@ -173,8 +248,8 @@ describe('meno() integration', () => {
     });
 
     const routes: unknown[] = [];
-    meno().hooks['astro:config:setup']({
-      config: { root: pathToFileURL(root + '/') },
+    menoBase().hooks['astro:config:setup']({
+      config: { root: pathToFileURL(`${root}/`) },
       updateConfig: () => {},
       addMiddleware: () => {},
       injectRoute: (r) => routes.push(r),
@@ -193,14 +268,41 @@ describe('meno() integration', () => {
     });
 
     const watched: (string | URL)[] = [];
-    meno().hooks['astro:config:setup']({
-      config: { root: pathToFileURL(root + '/') },
+    menoBase().hooks['astro:config:setup']({
+      config: { root: pathToFileURL(`${root}/`) },
       updateConfig: () => {},
       addMiddleware: () => {},
       addWatchFile: (p) => watched.push(p),
     });
 
     expect(watched).toEqual([join(root, 'project.config.json')]);
+  });
+
+  test('play mode does NOT watch project.config.json (settings saves must not restart the play server)', () => {
+    // A config watch-file turns every editor settings save into a full dev-server
+    // restart, which drops the play iframe's HMR socket and blanks the preview.
+    // Play keeps an always-on server instead — frozen config applies on re-toggle.
+    const root = projectRootWith({
+      defaultLocale: 'en',
+      locales: [{ code: 'en', name: 'English', nativeName: 'English', langTag: 'en-US' }],
+    });
+    const watched: (string | URL)[] = [];
+    const prev = process.env[MENO_PLAY_ENV];
+    process.env[MENO_PLAY_ENV] = '1';
+    try {
+      menoBase().hooks['astro:config:setup']({
+        config: { root: pathToFileURL(`${root}/`) },
+        command: 'dev',
+        updateConfig: () => {},
+        addMiddleware: () => {},
+        injectScript: () => {},
+        addWatchFile: (p) => watched.push(p),
+      });
+    } finally {
+      if (prev === undefined) delete process.env[MENO_PLAY_ENV];
+      else process.env[MENO_PLAY_ENV] = prev;
+    }
+    expect(watched).toEqual([]);
   });
 
   test('multi-locale without injectRoute (older Astro slice) degrades gracefully', () => {
@@ -213,8 +315,8 @@ describe('meno() integration', () => {
     });
 
     expect(() =>
-      meno().hooks['astro:config:setup']({
-        config: { root: pathToFileURL(root + '/') },
+      menoBase().hooks['astro:config:setup']({
+        config: { root: pathToFileURL(`${root}/`) },
         updateConfig: () => {},
         addMiddleware: () => {},
       }),
@@ -227,8 +329,8 @@ describe('meno() integration', () => {
     const prev = process.env[MENO_PLAY_ENV];
     process.env[MENO_PLAY_ENV] = '1';
     try {
-      meno().hooks['astro:config:setup']({
-        config: { root: pathToFileURL(root + '/') },
+      menoBase().hooks['astro:config:setup']({
+        config: { root: pathToFileURL(`${root}/`) },
         updateConfig: () => {},
         addMiddleware: () => {},
         injectScript: (stage, content) => injected.push({ stage, content }),
@@ -314,8 +416,8 @@ describe('meno() integration', () => {
     const prev = process.env[MENO_PLAY_ENV];
     process.env[MENO_PLAY_ENV] = '1';
     try {
-      meno().hooks['astro:config:setup']({
-        config: { root: pathToFileURL(root + '/') },
+      menoBase().hooks['astro:config:setup']({
+        config: { root: pathToFileURL(`${root}/`) },
         command: 'dev',
         updateConfig: (c) => updates.push(c),
         addMiddleware: () => {},
@@ -333,17 +435,19 @@ describe('meno() integration', () => {
     expect(pluginNames).toContain('meno-astro:play-patch');
     // …and the utility-css plugin's own full reload is suppressed so it can't
     // defeat the patch (the patch plugin owns reload-vs-patch in play dev).
-    const utility = (updates[0] as any).vite.plugins.find(
-      (p: any) => p.name === 'meno-astro:utility-css',
-    );
+    const utility = (updates[0] as any).vite.plugins.find((p: any) => p.name === 'meno-astro:utility-css');
     const sends: unknown[] = [];
     const handlers: Record<string, (f: string) => void> = {};
     utility.configureServer({
-      watcher: { on: (evt: string, cb: (f: string) => void) => { handlers[evt] = cb; } },
+      watcher: {
+        on: (evt: string, cb: (f: string) => void) => {
+          handlers[evt] = cb;
+        },
+      },
       moduleGraph: { getModuleById: () => null, invalidateModule: () => {} },
       ws: { send: (p: unknown) => sends.push(p) },
     });
-    handlers['change']!(join(root, 'src', 'pages', 'index.astro'));
+    handlers.change!(join(root, 'src', 'pages', 'index.astro'));
     expect(sends).toEqual([]);
   });
 
@@ -354,8 +458,8 @@ describe('meno() integration', () => {
     const prev = process.env[MENO_PLAY_ENV];
     process.env[MENO_PLAY_ENV] = '1';
     try {
-      meno().hooks['astro:config:setup']({
-        config: { root: pathToFileURL(root + '/') },
+      menoBase().hooks['astro:config:setup']({
+        config: { root: pathToFileURL(`${root}/`) },
         command: 'build',
         updateConfig: (c) => updates.push(c),
         addMiddleware: () => {},
@@ -370,14 +474,14 @@ describe('meno() integration', () => {
     expect(pluginNames).not.toContain('meno-astro:play-patch');
   });
 
-  test("non-play `astro dev`: utility-css plugin still full-reloads on .astro change", () => {
+  test('non-play `astro dev`: utility-css plugin still full-reloads on .astro change', () => {
     const root = projectRootWith({ defaultLocale: 'en', locales: [] });
     const updates: Record<string, unknown>[] = [];
     const prev = process.env[MENO_PLAY_ENV];
     delete process.env[MENO_PLAY_ENV];
     try {
-      meno().hooks['astro:config:setup']({
-        config: { root: pathToFileURL(root + '/') },
+      menoBase().hooks['astro:config:setup']({
+        config: { root: pathToFileURL(`${root}/`) },
         command: 'dev',
         updateConfig: (c) => updates.push(c),
         addMiddleware: () => {},
@@ -385,17 +489,19 @@ describe('meno() integration', () => {
     } finally {
       if (prev !== undefined) process.env[MENO_PLAY_ENV] = prev;
     }
-    const utility = (updates[0] as any).vite.plugins.find(
-      (p: any) => p.name === 'meno-astro:utility-css',
-    );
+    const utility = (updates[0] as any).vite.plugins.find((p: any) => p.name === 'meno-astro:utility-css');
     const sends: unknown[] = [];
     const handlers: Record<string, (f: string) => void> = {};
     utility.configureServer({
-      watcher: { on: (evt: string, cb: (f: string) => void) => { handlers[evt] = cb; } },
+      watcher: {
+        on: (evt: string, cb: (f: string) => void) => {
+          handlers[evt] = cb;
+        },
+      },
       moduleGraph: { getModuleById: () => null, invalidateModule: () => {} },
       ws: { send: (p: unknown) => sends.push(p) },
     });
-    handlers['change']!(join(root, 'src', 'pages', 'index.astro'));
+    handlers.change!(join(root, 'src', 'pages', 'index.astro'));
     expect(sends).toEqual([{ type: 'full-reload' }]);
   });
 
@@ -405,8 +511,8 @@ describe('meno() integration', () => {
     const prev = process.env[MENO_PLAY_ENV];
     delete process.env[MENO_PLAY_ENV];
     try {
-      meno().hooks['astro:config:setup']({
-        config: { root: pathToFileURL(root + '/') },
+      menoBase().hooks['astro:config:setup']({
+        config: { root: pathToFileURL(`${root}/`) },
         updateConfig: () => {},
         addMiddleware: () => {},
         injectScript: (...args) => injected.push(args),
@@ -417,14 +523,49 @@ describe('meno() integration', () => {
     expect(injected).toEqual([]);
   });
 
+  test('config extras: non-play build applies the project devToolbar + prefetch settings', () => {
+    const root = projectRootWithConfig({
+      i18n: { defaultLocale: 'en', locales: [] },
+      devToolbar: true,
+      prefetch: { enabled: true, defaultStrategy: 'viewport' },
+    });
+    const update = runConfigSetup(root, 'build', false);
+    expect(update.devToolbar).toEqual({ enabled: true });
+    expect(update.prefetch).toEqual({ prefetchAll: true, defaultStrategy: 'viewport' });
+  });
+
+  test('config extras: play HONORS the devToolbar toggle (preview = the play iframe) but drops prefetch', () => {
+    // The toolbar toggle is "show while previewing", so an enabled project shows it in play.
+    // prefetchAll only floods the single play dev server, so it's dropped. image still applies.
+    const root = projectRootWithConfig({
+      i18n: { defaultLocale: 'en', locales: [] },
+      devToolbar: true,
+      prefetch: { enabled: true, defaultStrategy: 'viewport' },
+      image: { domains: ['images.example.com'] },
+    });
+    const update = runConfigSetup(root, 'dev', true);
+    expect(update.devToolbar).toEqual({ enabled: true });
+    expect(update.prefetch).toBeUndefined();
+    expect(update.image).toEqual({ domains: ['images.example.com'] });
+  });
+
+  test('config extras: toolbar stays OFF by default (overrides Astro dev default-on) when unset', () => {
+    // No devToolbar key → explicit { enabled: false } so the toolbar never shows uninvited,
+    // in play and standalone dev alike (Astro would otherwise default it ON in dev).
+    const playUnset = runConfigSetup(projectRootWith({ defaultLocale: 'en', locales: [] }), 'dev', true);
+    expect(playUnset.devToolbar).toEqual({ enabled: false });
+    const devUnset = runConfigSetup(projectRootWith({ defaultLocale: 'en', locales: [] }), 'dev', false);
+    expect(devUnset.devToolbar).toEqual({ enabled: false });
+  });
+
   test('play mode (MENO_PLAY=1): registers the play-marker plugin that stamps every response', () => {
     const root = projectRootWith({ defaultLocale: 'en', locales: [] });
     const updates: Record<string, unknown>[] = [];
     const prev = process.env[MENO_PLAY_ENV];
     process.env[MENO_PLAY_ENV] = '1';
     try {
-      meno().hooks['astro:config:setup']({
-        config: { root: pathToFileURL(root + '/') },
+      menoBase().hooks['astro:config:setup']({
+        config: { root: pathToFileURL(`${root}/`) },
         updateConfig: (c) => updates.push(c),
         addMiddleware: () => {},
         injectScript: () => {},
@@ -448,10 +589,16 @@ describe('meno() integration', () => {
 
     const headers: Record<string, string> = {};
     let nextCalled = false;
-    handlers[0](
+    handlers[0]!(
       {},
-      { setHeader: (name: string, value: string) => { headers[name] = value; } },
-      () => { nextCalled = true; },
+      {
+        setHeader: (name: string, value: string) => {
+          headers[name] = value;
+        },
+      },
+      () => {
+        nextCalled = true;
+      },
     );
     expect(headers).toEqual({ [PLAY_MARKER_HEADER]: '1' });
     expect(nextCalled).toBe(true);
@@ -468,8 +615,8 @@ describe('meno() integration', () => {
     const prev = process.env[MENO_PLAY_ENV];
     delete process.env[MENO_PLAY_ENV];
     try {
-      meno().hooks['astro:config:setup']({
-        config: { root: pathToFileURL(root + '/') },
+      menoBase().hooks['astro:config:setup']({
+        config: { root: pathToFileURL(`${root}/`) },
         updateConfig: (c) => updates.push(c),
         addMiddleware: () => {},
       });
@@ -486,8 +633,8 @@ describe('meno() integration', () => {
     process.env[MENO_PLAY_ENV] = '1';
     try {
       expect(() =>
-        meno().hooks['astro:config:setup']({
-          config: { root: pathToFileURL(root + '/') },
+        menoBase().hooks['astro:config:setup']({
+          config: { root: pathToFileURL(`${root}/`) },
           updateConfig: () => {},
           addMiddleware: () => {},
         }),
@@ -502,7 +649,7 @@ describe('meno() integration', () => {
     const updates: Record<string, unknown>[] = [];
     const middlewares: unknown[] = [];
     expect(() =>
-      meno().hooks['astro:config:setup']({
+      menoBase().hooks['astro:config:setup']({
         config: {},
         updateConfig: (c) => updates.push(c),
         addMiddleware: (m) => middlewares.push(m),
@@ -540,6 +687,29 @@ describe('collectUtilitySources', () => {
   });
 });
 
+describe('frameworkFsAllow (island hydration /@fs/ allow-list)', () => {
+  test('always includes the project root (Vite root) and returns absolute dirs', () => {
+    const allow = frameworkFsAllow('/tmp/some-project');
+    // The Vite root is always allowed, so the list is never empty even with no framework
+    // renderer installed — Astro concatenates this onto its own fs.allow.
+    expect(allow).toContain('/tmp/some-project');
+    expect(allow.every((p) => typeof p === 'string' && p.length > 0)).toBe(true);
+    // No duplicates (Set-backed).
+    expect(new Set(allow).size).toBe(allow.length);
+  });
+
+  test('adds the hoisting root (parent of node_modules) of any resolvable package', () => {
+    // meno-astro resolves from this monorepo, so its hoisting root — the dir CONTAINING the
+    // node_modules it lives in — is added alongside the project root. Every added entry must
+    // therefore be a real ancestor dir, never a path that still contains `/node_modules/`.
+    const allow = frameworkFsAllow('/tmp/some-project');
+    for (const p of allow) {
+      if (p === '/tmp/some-project') continue;
+      expect(p.includes(`${sep}node_modules${sep}`)).toBe(false);
+    }
+  });
+});
+
 describe('utility-css vite plugin (query-aware virtual module)', () => {
   // A real styled component file the parser fully understands (frontmatter + body),
   // so buildStart() produces a non-empty sheet.
@@ -550,9 +720,11 @@ describe('utility-css vite plugin (query-aware virtual module)', () => {
   // Pull the registered plugin object out of the integration's updateConfig payload.
   function getPlugin(root: string): any {
     let captured: any;
-    meno().hooks['astro:config:setup']({
-      config: { root: pathToFileURL(root + '/') },
-      updateConfig: (c: any) => { captured = c; },
+    menoBase().hooks['astro:config:setup']({
+      config: { root: pathToFileURL(`${root}/`) },
+      updateConfig: (c: any) => {
+        captured = c;
+      },
       addMiddleware: () => {},
     });
     return captured.vite.plugins.find((p: any) => p.name === 'meno-astro:utility-css');
@@ -567,14 +739,14 @@ describe('utility-css vite plugin (query-aware virtual module)', () => {
     return dir;
   }
 
-  const RESOLVED = '\0' + UTILITY_CSS_MODULE;
+  const RESOLVED = `\0${UTILITY_CSS_MODULE}`;
 
   test('resolveId maps the bare id and preserves ?inline / ?direct queries', () => {
     const plugin = getPlugin(rootWithStyle());
     expect(plugin.resolveId(UTILITY_CSS_MODULE)).toBe(RESOLVED);
     // The ?inline variant astro re-imports in dev must resolve to the SAME module + query.
-    expect(plugin.resolveId(UTILITY_CSS_MODULE + '?inline')).toBe(RESOLVED + '?inline');
-    expect(plugin.resolveId(RESOLVED + '?direct')).toBe(RESOLVED + '?direct');
+    expect(plugin.resolveId(`${UTILITY_CSS_MODULE}?inline`)).toBe(`${RESOLVED}?inline`);
+    expect(plugin.resolveId(`${RESOLVED}?direct`)).toBe(`${RESOLVED}?direct`);
     // Unrelated ids are not claimed.
     expect(plugin.resolveId('some-other-module')).toBeNull();
     expect(plugin.resolveId('foo.css')).toBeNull();
@@ -587,7 +759,7 @@ describe('utility-css vite plugin (query-aware virtual module)', () => {
     expect(typeof bare).toBe('string');
     expect(bare).toContain('color: red'); // the utility class rule the component contributes
     // The dev re-import (?inline) must load the same content — this is the astro-dev fix.
-    expect(plugin.load(RESOLVED + '?inline')).toBe(bare);
+    expect(plugin.load(`${RESOLVED}?inline`)).toBe(bare);
     // Non-matching ids return null.
     expect(plugin.load('\0something-else')).toBeNull();
   });
@@ -603,12 +775,16 @@ describe('utility-css vite plugin (query-aware virtual module)', () => {
     plugin.buildStart();
     // Astro resolves the ?inline variant during dev rendering — simulate that
     // so the plugin has seen it before the change event.
-    expect(plugin.resolveId(UTILITY_CSS_MODULE + '?inline')).toBe(RESOLVED + '?inline');
+    expect(plugin.resolveId(`${UTILITY_CSS_MODULE}?inline`)).toBe(`${RESOLVED}?inline`);
 
     const invalidated: string[] = [];
     const handlers: Record<string, (f: string) => void> = {};
     plugin.configureServer({
-      watcher: { on: (evt: string, cb: (f: string) => void) => { handlers[evt] = cb; } },
+      watcher: {
+        on: (evt: string, cb: (f: string) => void) => {
+          handlers[evt] = cb;
+        },
+      },
       moduleGraph: {
         // Every id is "in the graph": return a token carrying the id…
         getModuleById: (id: string) => ({ id }),
@@ -617,9 +793,9 @@ describe('utility-css vite plugin (query-aware virtual module)', () => {
       },
       ws: { send: () => {} },
     });
-    handlers['change']!(join(root, 'src', 'index.astro'));
+    handlers.change!(join(root, 'src', 'index.astro'));
     expect(invalidated).toContain(RESOLVED);
-    expect(invalidated).toContain(RESOLVED + '?inline');
+    expect(invalidated).toContain(`${RESOLVED}?inline`);
   });
 });
 
@@ -675,30 +851,27 @@ describe('static asset bridge', () => {
     const out = mkdtempSync(join(tmpdir(), 'meno-out-'));
     tmps.push(out);
 
-    const integ = meno();
+    const integ = menoBase();
     // config:setup captures the project root from config.root…
     integ.hooks['astro:config:setup']({
-      config: { root: pathToFileURL(root + '/') },
+      config: { root: pathToFileURL(`${root}/`) },
       updateConfig: () => {},
       addMiddleware: () => {},
     });
     // …then build:done copies root asset dirs into the output dir.
-    integ.hooks['astro:build:done']({ dir: pathToFileURL(out + '/') });
+    integ.hooks['astro:build:done']({ dir: pathToFileURL(`${out}/`) });
 
     expect(readFileSync(join(out, 'fonts', 'inter.woff2'), 'utf8')).toBe('FONTDATA');
   });
 
   test('astro:build:done with no dir is a no-op (no throw)', () => {
-    expect(() => meno().hooks['astro:build:done']({})).not.toThrow();
+    expect(() => menoBase().hooks['astro:build:done']({})).not.toThrow();
   });
 });
 
 describe('siteUrl → Astro `site` + sitemap.xml', () => {
   /** A scratch project with a config and (optionally) emitted-shape pages. */
-  function makeProject(
-    config: Record<string, unknown>,
-    pages: Record<string, string> = {},
-  ): string {
+  function makeProject(config: Record<string, unknown>, pages: Record<string, string> = {}): string {
     const dir = mkdtempSync(join(tmpdir(), 'meno-sitemap-'));
     tmps.push(dir);
     writeFileSync(join(dir, 'project.config.json'), JSON.stringify(config), 'utf8');
@@ -726,34 +899,34 @@ describe('siteUrl → Astro `site` + sitemap.xml', () => {
   ): string {
     const out = mkdtempSync(join(tmpdir(), 'meno-sitemap-out-'));
     tmps.push(out);
-    const integ = meno();
+    const integ = menoBase();
     integ.hooks['astro:config:setup']({
-      config: { root: pathToFileURL(root + '/') },
+      config: { root: pathToFileURL(`${root}/`) },
       updateConfig: (c) => onSetup?.(c),
       addMiddleware: () => {},
     });
-    integ.hooks['astro:build:done']({ dir: pathToFileURL(out + '/'), pages });
+    integ.hooks['astro:build:done']({ dir: pathToFileURL(`${out}/`), pages });
     return out;
   }
 
   test('astro:config:setup maps the project siteUrl onto Astro `site`', () => {
     const root = makeProject({ siteUrl: 'https://example.com/', i18n: I18N });
     const updates: Record<string, unknown>[] = [];
-    meno().hooks['astro:config:setup']({
-      config: { root: pathToFileURL(root + '/') },
+    menoBase().hooks['astro:config:setup']({
+      config: { root: pathToFileURL(`${root}/`) },
       updateConfig: (c) => updates.push(c),
       addMiddleware: () => {},
     });
     // Trailing slash trimmed by loadSiteUrl; one updateConfig call carries everything.
     expect(updates).toHaveLength(1);
-    expect(updates[0].site).toBe('https://example.com');
+    expect(updates[0]!.site).toBe('https://example.com');
   });
 
   test('a user-configured `site` wins over the project siteUrl', () => {
     const root = makeProject({ siteUrl: 'https://example.com', i18n: I18N });
     const updates: Record<string, unknown>[] = [];
-    meno().hooks['astro:config:setup']({
-      config: { root: pathToFileURL(root + '/'), site: 'https://user.dev' },
+    menoBase().hooks['astro:config:setup']({
+      config: { root: pathToFileURL(`${root}/`), site: 'https://user.dev' },
       updateConfig: (c) => updates.push(c),
       addMiddleware: () => {},
     });
@@ -763,8 +936,8 @@ describe('siteUrl → Astro `site` + sitemap.xml', () => {
   test('no project siteUrl → `site` not set at all', () => {
     const root = makeProject({ i18n: I18N });
     const updates: Record<string, unknown>[] = [];
-    meno().hooks['astro:config:setup']({
-      config: { root: pathToFileURL(root + '/') },
+    menoBase().hooks['astro:config:setup']({
+      config: { root: pathToFileURL(`${root}/`) },
       updateConfig: (c) => updates.push(c),
       addMiddleware: () => {},
     });
@@ -791,12 +964,8 @@ describe('siteUrl → Astro `site` + sitemap.xml', () => {
     const xml = readFileSync(join(out, 'sitemap.xml'), 'utf8');
     expect(xml).toContain('<loc>https://example.com/about</loc>');
     expect(xml).toContain('<loc>https://example.com/pl/o-nas</loc>');
-    expect(xml).toContain(
-      '<xhtml:link rel="alternate" hreflang="pl-PL" href="https://example.com/pl/o-nas"/>',
-    );
-    expect(xml).toContain(
-      '<xhtml:link rel="alternate" hreflang="x-default" href="https://example.com/about"/>',
-    );
+    expect(xml).toContain('<xhtml:link rel="alternate" hreflang="pl-PL" href="https://example.com/pl/o-nas"/>');
+    expect(xml).toContain('<xhtml:link rel="alternate" hreflang="x-default" href="https://example.com/about"/>');
     // Unroutable page: listed, but plainly (no alternates pointing at 404s).
     expect(xml).toContain('<url><loc>https://example.com/blog/my-post</loc></url>');
     // Error route excluded outright.
@@ -826,5 +995,17 @@ describe('siteUrl → Astro `site` + sitemap.xml', () => {
     const root = makeProject({ siteUrl: 'https://example.com', i18n: I18N });
     expect(existsSync(join(runBuild(root, undefined), 'sitemap.xml'))).toBe(false);
     expect(existsSync(join(runBuild(root, []), 'sitemap.xml'))).toBe(false);
+  });
+});
+
+describe('adapterFactoryOptions (per-adapter factory args)', () => {
+  test('node carries a mode (default standalone; explicit honored)', () => {
+    expect(adapterFactoryOptions({ name: 'node' })).toEqual({ mode: 'standalone' });
+    expect(adapterFactoryOptions({ name: 'node', mode: 'middleware' })).toEqual({ mode: 'middleware' });
+  });
+  test('vercel/netlify/cloudflare take no options', () => {
+    for (const name of ['vercel', 'netlify', 'cloudflare']) {
+      expect(adapterFactoryOptions({ name })).toBeUndefined();
+    }
   });
 });

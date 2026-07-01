@@ -23,12 +23,14 @@ import { emitComponent } from './emit/emitComponent';
 import { parseFile } from './parse/parseFile';
 import type { NodeSpan } from './parse/parseContext';
 import { normalizeModel } from './normalize';
+import { lowerInteractiveToTokens, liftTokensToInteractive } from './interactiveVariants';
 import type { EmitOptions } from './emit/emitContext';
 
 export type { EmitOptions };
 
 export { normalizeModel };
 export { buildAstroLineMap, type LineMap, type LineRange } from './lineMap';
+export { promoteCustomComponent, validatePromotedSource, type PromoteResult } from './promoteCustom';
 
 /** The on-disk component file shape: `{ component: StructuredComponentDefinition }`. */
 export interface ComponentFile {
@@ -61,13 +63,21 @@ export interface MenoRegion {
 export interface ParseResult {
   model: DialectModel;
   regions: MenoRegion[];
+  /**
+   * Set when the source is outside the dialect (frontmatter the codec can't model). The
+   * `model` is then best-effort/lossy — callers (e.g. the Astro page provider) should treat
+   * the file as read-only and NOT re-emit it. See `detectForeignFrontmatter`.
+   */
+  unsupported?: { reason: string };
 }
 
 /** Serialize the Meno model to deterministic `.astro` dialect source. */
 export function emit(model: DialectModel, opts?: EmitOptions): string {
   // Canonicalize first (migrate legacy types, drop empties) so emit accepts raw models
   // and always produces canonical .astro. Symmetric with parse() normalizing its output.
-  const m = normalizeModel(model) as Record<string, any>;
+  // Then lower losslessly-convertible interactiveStyles (hover/focus/active) into variant-class
+  // tokens on attributes.class (parse lifts them back — see dialect/interactiveVariants.ts).
+  const m = lowerInteractiveToTokens(normalizeModel(model)) as Record<string, unknown>;
   if (m && typeof m === 'object') {
     // On-disk component file: { component: { … } }
     if (m.component && typeof m.component === 'object') return emitComponent(m.component, opts);
@@ -111,8 +121,17 @@ function collectVerbatimRegions(model: unknown, spans: Map<object, NodeSpan>): M
 
 /** Parse `.astro` dialect source back into the Meno model (+ tracked regions). */
 export function parse(source: string): ParseResult {
-  const { model, spans } = parseFile(source, { collectSpans: true });
+  const { model, spans, frontmatterRegions, unsupported } = parseFile(source, { collectSpans: true });
   const regions = spans ? collectVerbatimRegions(model, spans) : [];
+  // Captured verbatim frontmatter passthrough (`_frontmatter`) — each foreign statement run
+  // is reported as a `kind: 'verbatim'` region (its absolute source span).
+  if (frontmatterRegions) {
+    for (const s of frontmatterRegions) regions.push({ kind: 'verbatim', start: s.start, end: s.end });
+    regions.sort((a, b) => a.start - b.start);
+  }
+  // Lift state-variant class tokens (hover:/focus:/active:) back into reconstructed
+  // interactiveStyles before canonicalizing (the inverse of emit's lowering).
+  liftTokensToInteractive(model);
   // Output is canonicalized so the editor always sees a normalized model.
-  return { model: normalizeModel(model) as DialectModel, regions };
+  return { model: normalizeModel(model) as DialectModel, regions, unsupported };
 }

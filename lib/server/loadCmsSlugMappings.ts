@@ -57,8 +57,8 @@
  * the next render without explicit invalidation; unparseable items are skipped.
  */
 
-import { existsSync, readdirSync, readFileSync, statSync } from 'fs';
-import { basename, dirname, join, relative, sep } from 'path';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { basename, dirname, join, relative, sep } from 'node:path';
 import { readPageMeta } from '../dialect/parse/parseFrontmatter';
 import { loadI18nConfig } from './loadI18nConfig';
 import { CMS_ROUTE_FILE } from '../dialect/cmsRoute';
@@ -138,7 +138,7 @@ function collectTemplateFiles(pagesDir: string): string[] {
 /** Parse one template file's `meta.cms` into a {@link CmsTemplateInfo} (null = not CMS). */
 function readTemplateInfo(file: string, pagesDir: string): CmsTemplateInfo | null {
   const meta = readPageMeta(readFileSync(file, 'utf8'));
-  if (!meta || meta.source !== 'cms') return null;
+  if (meta?.source !== 'cms') return null;
   const cms = meta.cms as Record<string, unknown> | undefined;
   if (!cms || typeof cms !== 'object') return null;
   const collectionId = cms.id;
@@ -262,9 +262,7 @@ export function loadCmsSlugMappings(projectRoot: string): CmsSlugEntry[] {
       if (!existsSync(dir)) continue;
       // Flat scan, published items only — the AstroCMSProvider.getItems contract
       // (`*.draft.json` siblings are unpublished WIP versions).
-      const files = readdirSync(dir).filter(
-        (f) => f.endsWith('.json') && !f.endsWith(DRAFT_FILE_SUFFIX),
-      );
+      const files = readdirSync(dir).filter((f) => f.endsWith('.json') && !f.endsWith(DRAFT_FILE_SUFFIX));
       for (const f of files) {
         const file = join(dir, f);
         seenItems.add(file);
@@ -345,9 +343,8 @@ export function resolveCmsItemUrls(
     let url: string;
     try {
       const slug =
-        (config
-          ? itemSlugForLocale(data, slugField, filename, defaultLocale, config)
-          : usableSlug(data[slugField])) ?? filename;
+        (config ? itemSlugForLocale(data, slugField, filename, defaultLocale, config) : usableSlug(data[slugField])) ??
+        filename;
       url = routeDir ? `/${routeDir}/${slug}` : `/${slug}`;
     } catch {
       url = `/${source}/${filename}`;
@@ -383,15 +380,11 @@ export function resolveCmsItemUrls(
  * Runs inside the consuming project's `astro build`/`dev` (cwd = project root, the
  * loadFontCss precedent). Never throws — any failure returns the data unchanged.
  */
-export function resolveCmsEntrySlug(
-  data: Record<string, unknown>,
-  collectionId: string,
-): Record<string, unknown> {
+export function resolveCmsEntrySlug(data: Record<string, unknown>, collectionId: string): Record<string, unknown> {
   try {
     if (!data || typeof data !== 'object') return data;
     const root = process.cwd();
-    const slugField =
-      scanCmsTemplates(root).find((t) => t.collectionId === collectionId)?.slugField ?? 'slug';
+    const slugField = scanCmsTemplates(root).find((t) => t.collectionId === collectionId)?.slugField ?? 'slug';
     const value = data[slugField];
     if (!isI18nValue(value)) return data;
     const config = loadI18nConfig(root);

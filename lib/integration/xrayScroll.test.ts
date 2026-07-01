@@ -71,14 +71,14 @@ describe('scrollWindowToElement (play-iframe scroll: top with a small gap)', () 
     const { scroll, elAt, calls } = makeScroller({ innerHeight: 800, scrollY: 0 });
     scroll(elAt({ top: 1000, bottom: 1200, left: 0, right: 100 }));
     expect(calls).toHaveLength(1);
-    expect(calls[0].top).toBe(1000 - GAP); // 0 + 1000 - 24
-    expect(calls[0].behavior).toBe('smooth');
+    expect(calls[0]!.top).toBe(1000 - GAP); // 0 + 1000 - 24
+    expect(calls[0]!.behavior).toBe('smooth');
   });
 
   test('element above the inset scrolls up to top - GAP (respects current scrollY)', () => {
     const { scroll, elAt, calls } = makeScroller({ innerHeight: 800, scrollY: 500 });
     scroll(elAt({ top: -100, bottom: 100, left: 0, right: 100 }));
-    expect(calls[0].top).toBe(500 - 100 - GAP); // 376
+    expect(calls[0]!.top).toBe(500 - 100 - GAP); // 376
   });
 
   test('element already comfortably in view does not move the window', () => {
@@ -92,13 +92,13 @@ describe('scrollWindowToElement (play-iframe scroll: top with a small gap)', () 
     const { scroll, elAt, calls } = makeScroller({ innerHeight: 800, scrollY: 0 });
     // bottom (1500) > viewH (800), so even with top (40) >= GAP it scrolls.
     scroll(elAt({ top: 40, bottom: 1500, left: 0, right: 100 }));
-    expect(calls[0].top).toBe(40 - GAP); // 16
+    expect(calls[0]!.top).toBe(40 - GAP); // 16
   });
 
   test('target never goes negative (clamped to 0)', () => {
     const { scroll, elAt, calls } = makeScroller({ innerHeight: 800, scrollY: 0 });
     scroll(elAt({ top: -1000, bottom: -800, left: 0, right: 100 }));
-    expect(calls[0].top).toBe(0); // 0 + (-1000) - 24 = -1024 → clamped
+    expect(calls[0]!.top).toBe(0); // 0 + (-1000) - 24 = -1024 → clamped
   });
 
   test('a stuck sticky header pushes the landing below it (inset = header bottom + GAP)', () => {
@@ -109,7 +109,7 @@ describe('scrollWindowToElement (play-iframe scroll: top with a small gap)', () 
     const { scroll, elAt, calls } = makeScroller({ innerHeight: 800, scrollY: 0 }, [header]);
     scroll(elAt({ top: 1000, bottom: 1200, left: 0, right: 100 }));
     // inset = 60 + 24 = 84 → targetY = 0 + 1000 - 84
-    expect(calls[0].top).toBe(1000 - (60 + GAP));
+    expect(calls[0]!.top).toBe(1000 - (60 + GAP));
   });
 
   test('a non-sticky element at the top is ignored by the header probe', () => {
@@ -119,6 +119,6 @@ describe('scrollWindowToElement (play-iframe scroll: top with a small gap)', () 
     };
     const { scroll, elAt, calls } = makeScroller({ innerHeight: 800, scrollY: 0 }, [banner]);
     scroll(elAt({ top: 1000, bottom: 1200, left: 0, right: 100 }));
-    expect(calls[0].top).toBe(1000 - GAP); // inset falls back to just GAP
+    expect(calls[0]!.top).toBe(1000 - GAP); // inset falls back to just GAP
   });
 });

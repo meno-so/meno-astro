@@ -13,8 +13,8 @@
  * and reuses meno-core wholesale — no migration logic is reinvented here.
  */
 
-import { readFileSync, statSync } from 'fs';
-import { join } from 'path';
+import { readFileSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 import { migrateI18nConfig, DEFAULT_I18N_CONFIG } from 'meno-core/shared';
 import type { I18nConfig } from 'meno-core/shared';
 

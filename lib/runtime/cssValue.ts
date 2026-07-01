@@ -70,6 +70,6 @@ export function sanitizeCssValue(value: string): string {
  * bridged — a base template renders directly inline (it needs no media query).
  */
 export function templateVarName(breakpoint: string, cssProp: string): string {
-  const kebab = cssProp.replace(/[A-Z]/g, (m) => '-' + m.toLowerCase());
+  const kebab = cssProp.replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`);
   return `--m-${breakpoint}-${kebab}`;
 }

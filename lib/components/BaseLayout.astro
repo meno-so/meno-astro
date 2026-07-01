@@ -46,6 +46,10 @@ import {
   loadFontCss,
   loadLibraries,
   loadIconsConfig,
+  loadCustomCode,
+  mergeCustomCode,
+  loadSocial,
+  buildSocialMetaTags,
   loadI18nConfig,
   loadSiteUrl,
   loadSlugMappings,
@@ -55,6 +59,10 @@ import {
   menoFilterScript,
 } from 'meno-astro';
 import type { MenoPageMeta } from 'meno-astro';
+// Astro's View Transitions router (Astro 6 renamed `ViewTransitions` → `ClientRouter`).
+// Rendered in <head> only when this page opts in (`meta.viewTransitions`) — the import is
+// inert otherwise. `astro:transitions` is a built-in virtual module (no extra dep / config).
+import { ClientRouter } from 'astro:transitions';
 // The project's global utility stylesheet, generated at build time by the meno()
 // integration (scans every style() → utility classes + prop-mapping variants). This
 // replaces the per-render style() collector (Astro renders <head> before the body, so
@@ -72,6 +80,12 @@ interface Props {
 }
 
 const { meta } = Astro.props;
+
+// Host-framework <html> attributes captured at import by the faithful-mirror importer
+// (e.g. Webflow's data-wf-page / data-wf-site, which its interaction engine reads to arm a
+// page's interactions). Spread onto <html> so a mirrored site boots its runtime exactly as
+// the original; empty (no-op) for normal projects. `lang` is excluded at capture — set below.
+const htmlAttributes = meta?.htmlAttributes && typeof meta.htmlAttributes === 'object' ? meta.htmlAttributes : {};
 
 // Active locale: Astro's i18n routing answer, else the *project's* default locale (a
 // non-en default project must not fall back to "en"). Used for <html lang> + hreflang.
@@ -134,20 +148,66 @@ const { headCSS, headJS, bodyEndJS } = loadLibraries(process.cwd(), meta);
 const icons = loadIconsConfig(process.cwd());
 const hasDarkFavicon = !!(icons.favicon && icons.faviconDark);
 
+// Custom code injection — project-wide `customCode` (project.config.json) merged with this
+// page's `meta.customCode` (global first, page appended), injected raw into <head> /
+// after <body> / before </body>. The dialect twin of meno-core's SSR custom-code block
+// (htmlGenerator merges configService.getCustomCode() + the page's meta.customCode the same
+// way). Empty sections render nothing. Author-trusted HTML (the editor's "Custom Code"
+// panel) → set:html, matching SSR.
+const customCode = mergeCustomCode(loadCustomCode(process.cwd()), meta?.customCode);
+
+// Native social/SEO head tags — `og:*` / `twitter:*` / `<meta name="keywords">` built from the
+// page's `meta` fields (the Studio "Open Graph" / "SEO" panels write these). Rendered here so
+// these fields no longer need hand-written `meta.customCode` to appear. The og/twitter VALUES
+// are resolved through i18n() (active-locale context already open via the locale middleware),
+// matching how `title`/`description` resolve above. og:image is absolutized against `siteUrl`;
+// og:url reuses the same canonical URL BaseLayout emits below (canonical/hreflang stay owned by
+// BaseLayout — the helper does NOT re-emit them). Defers to customCode per-surface so an
+// imported project that still carries og/twitter/keywords in customCode.head is not duplicated
+// (see buildSocialMetaTags). `social.twitterHandle` is the project-level handle.
+const social = loadSocial(process.cwd());
+const socialMetaTags = buildSocialMetaTags({
+  title,
+  description,
+  keywords: i18n(meta?.keywords ?? ''),
+  ogTitle: i18n(meta?.ogTitle ?? ''),
+  ogDescription: i18n(meta?.ogDescription ?? ''),
+  ogImage: typeof meta?.ogImage === 'string' ? meta.ogImage : '',
+  ogType: typeof meta?.ogType === 'string' ? meta.ogType : '',
+  url: canonicalUrl,
+  siteUrl,
+  twitterHandle: social.twitterHandle,
+  customCodeHead: customCode.head ?? '',
+});
+
+// View Transitions opt-in: when the page sets `meta.viewTransitions`, render Astro's
+// `<ClientRouter>` in <head> so navigations animate as same-document view transitions.
+// (For cross-page transitions the destination page must also opt in — the router is the
+// persistent <head> element Astro swaps around.) Off by default; rides the `meta` literal,
+// so it round-trips through the codec with no emit/parse change.
+const viewTransitions = !!meta?.viewTransitions;
+
 // Base reset — mirrors the SSR runtime's reset (meno-core htmlGenerator.ts) so the Astro
 // format renders without leftover UA defaults (body margin, heading margins). The SSR reset's
 // `.olink` rule is NOT reproduced as a class here: meno-astro dissolves it into the SAME utility
 // classes the `style()` collector already emits — every link carries `block no-underline
 // text-inherit`, applied at render by the Link.astro runtime component (linkClass), conflict-aware
-// so the link's own `display`/`text-decoration`/`color` still win. The `.oem` embed reset stays
-// SSR-only for now — its `.oem > *` child rule has no utility form. `@layer base` keeps this below
-// every unlayered component style the collector emits, so components always win.
+// so the link's own `display`/`text-decoration`/`color` still win. The `.oem` embed reset, by
+// contrast, IS reproduced verbatim from SSR (`line-height: 0` kills the inline-block descender
+// gap that otherwise floats an inline-SVG/icon embed UP inside a flex-centered box — a
+// `<button>` carousel arrow rendered correctly in meno-core but off-center in Astro). It's a
+// literal rule (not a utility class) because `Embed.astro` stamps the matching `oem` class on
+// its wrapper; the `.oem > *` child rule restores a normal line-height so block rich-text inside
+// a styled `<Embed>` (CMS content) doesn't collapse its lines. `@layer base` keeps all of this
+// below every unlayered component style the collector emits, so components always win.
 const BASE_RESET_CSS = `@layer base {
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', sans-serif; }
   button { background: none; border: none; padding: 0; font: inherit; cursor: pointer; outline: inherit; }
   img { max-width: 100%; height: auto; }
   picture { display: block; }
+  .oem { display: inline-block; vertical-align: top; line-height: 0; }
+  .oem > * { line-height: normal; }
 }`;
 
 // --- Play-preview FOUC fix (dev play mode only) -----------------------------
@@ -177,18 +237,26 @@ if (inlineDevSheets) {
 }
 ---
 <!doctype html>
-<html lang={lang}>
+<html {...htmlAttributes} lang={lang}>
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    {/* View Transitions — Astro's client-side router, opt-in per page (meta.viewTransitions). */}
+    {viewTransitions ? <ClientRouter /> : null}
     {fontPreloads ? <Fragment set:html={fontPreloads} /> : null}
     {fontFaceCss ? <style set:html={fontFaceCss}></style> : null}
     <style set:html={BASE_RESET_CSS}></style>
-    {/* Author library CSS/JS — after the reset so library styles win the cascade. */}
+    {/* Author library CSS/JS — after the reset so library styles win the cascade. Default
+        classic library scripts land here as BLOCKING <head> tags (loadLibraries' load-order
+        fix): they must define their globals (EmblaCarousel, …) before the inline component
+        init scripts emitted mid-body run, or the `typeof X !== 'undefined'` guards short-
+        circuit and carousels/sliders never initialize. */}
     {headCSS ? <Fragment set:html={headCSS} /> : null}
     {headJS ? <Fragment set:html={headJS} /> : null}
     {title ? <title>{title}</title> : null}
     {description ? <meta name="description" content={String(description)} /> : null}
+    {/* Discourage search indexing for this page (meta.noindex — the SEO panel's "noindex"). */}
+    {meta?.noindex ? <meta name="robots" content="noindex" /> : null}
     {/* Favicons (project.config.json `icons`). When a dark favicon is also set, the default
         is scoped to the light scheme; otherwise it carries no media (`undefined` → omitted). */}
     {icons.favicon ? <link rel="icon" href={icons.favicon} media={hasDarkFavicon ? '(prefers-color-scheme: light)' : undefined} /> : null}
@@ -196,6 +264,13 @@ if (inlineDevSheets) {
     {icons.appleTouchIcon ? <link rel="apple-touch-icon" href={icons.appleTouchIcon} /> : null}
     {canonicalUrl ? <link rel="canonical" href={canonicalUrl} /> : null}
     {hreflangs.map(({ hreflang, href }) => <link rel="alternate" hreflang={hreflang} href={href} />)}
+    {/* Native social/SEO tags (og:* / twitter:* / keywords) from the page's meta fields — before
+        customCode so author customCode (last) still wins. Self-suppressing when customCode already
+        declares those tags (imported-project SEO), so it never duplicates. */}
+    {socialMetaTags ? <Fragment set:html={socialMetaTags} /> : null}
+    {/* Author custom head code (project-wide + this page's meta.customCode) — last in <head>
+        so it can override/augment anything above (custom meta/OG/JSON-LD/analytics). */}
+    {customCode.head ? <Fragment set:html={customCode.head} /> : null}
     {/* Dev play only: real inline copies of the Vite-injected sheets so a navigation's
         first paint is styled (see the inlineDevSheets note above). */}
     {inlineDevSheets && themeCssInline ? (
@@ -206,8 +281,14 @@ if (inlineDevSheets) {
     ) : null}
   </head>
   <body>
+    {/* Author custom body-start code (project-wide + this page's meta.customCode), right
+        after <body> — parity with meno-core SSR's bodyStart injection. */}
+    {customCode.bodyStart ? <Fragment set:html={customCode.bodyStart} /> : null}
     <slot />
     {bodyEndJS ? <Fragment set:html={bodyEndJS} /> : null}
+    {/* Author custom body-end code (project-wide + this page's meta.customCode), before the
+        runtime scripts/`</body>` — parity with meno-core SSR's bodyEnd injection. */}
+    {customCode.bodyEnd ? <Fragment set:html={customCode.bodyEnd} /> : null}
     {/* Client form-submit handler for <Form submitHandler="fetch"> — parity with
         meno-core's SSR (htmlGenerator injects formHandlerScript). Self-gating (no-op
         without a fetch form on the page), so it's emitted unconditionally. is:inline

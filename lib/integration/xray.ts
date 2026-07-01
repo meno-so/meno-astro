@@ -71,10 +71,10 @@
  * (the editor's navigationHistory cmsItemContext has no bridge counterpart).
  */
 
-import { readFileSync } from 'fs';
+import { readFileSync } from 'node:fs';
 import { parseFile } from '../dialect/parse/parseFile';
 import type { NodeSpan } from '../dialect/parse/parseContext';
-import { rewriteViewportUnits } from './viewportUnits';
+import { rewriteViewportUnitsInStylesheet } from './viewportUnits';
 
 /** `message` event `data.type` the editor posts X-Ray targets with. */
 export const PLAY_XRAY_MESSAGE_TYPE = 'meno:astro:xray';
@@ -158,6 +158,22 @@ type Node = Record<string, unknown>;
 /** Node types whose open tag renders (or forwards onto) a real DOM element. */
 const STAMPABLE_TYPES = new Set(['node', 'link']);
 
+/**
+ * Node types that are opaque to Meno — an island (`<Counter client:* />`) or a
+ * custom `.astro` black box (`<Fancy />`). Their open tag is a *component*
+ * invocation, so a spliced `data-element-path` would land on `Astro.props`, not
+ * on any DOM element (Astro never forwards unknown attributes to a component's
+ * rendered root). They can't forward identity the way Meno components do either
+ * (no Meno-controlled root). So instead of stamping their tag we WRAP them in a
+ * `display:contents` element that carries the path — a real, click-resolvable
+ * DOM ancestor with zero layout footprint. Play-only (serve-time); the on-disk
+ * `.astro` and real builds never see it.
+ */
+const WRAPPABLE_TYPES = new Set(['island', 'custom']);
+
+/** The serve-time wrapper element name for {@link WRAPPABLE_TYPES} nodes. */
+const XRAY_WRAP_TAG = 'meno-x';
+
 /** The tracked root node of a parsed model: a page's `root` or a component's `structure`. */
 function rootNode(model: Record<string, unknown>): Node | undefined {
   const component = model.component as Record<string, unknown> | undefined;
@@ -193,8 +209,24 @@ export function stampElementPaths(source: string): string {
       while (i < span.end && !(source[i] === '<' && /[A-Za-z]/.test(source[i + 1] ?? ''))) i++;
       if (i >= span.end) return;
       let j = i + 1;
-      while (j < span.end && /[A-Za-z0-9.\-_]/.test(source[j])) j++;
+      while (j < span.end && /[A-Za-z0-9.\-_]/.test(source[j] ?? '')) j++;
       splices.push({ pos: j, text });
+    };
+
+    // Wrap an opaque island/custom node (WRAPPABLE_TYPES) in a `display:contents`
+    // element carrying its path. Wrapping the WHOLE span — not the inner tag —
+    // is correct for both shapes the parser records: a plain element's span is
+    // exactly `<Tag …/>`, so this becomes `<meno-x …><Tag/></meno-x>`; an
+    // `if`-wrapped element's span is the whole `{cond && (<Tag/>)}`, so it
+    // becomes `<meno-x …>{cond && (<Tag/>)}</meno-x>` (wrapper always present,
+    // the node conditional inside — still valid markup). `display:contents`
+    // keeps it out of layout; the bridge unions descendants for its rect.
+    const wrapAt = (span: NodeSpan, key: string, slotStamp: string): void => {
+      splices.push({
+        pos: span.start,
+        text: `<${XRAY_WRAP_TAG} data-element-path="${key}"${slotStamp} style="display:contents">`,
+      });
+      splices.push({ pos: span.end, text: `</${XRAY_WRAP_TAG}>` });
     };
 
     // `slotOwner`: the (file-local) path of the nearest enclosing component
@@ -222,7 +254,7 @@ export function stampElementPaths(source: string): string {
             stampAt(
               span,
               ` ${INSTANCE_ATTR}={[Astro.props['${INSTANCE_ATTR}'], '${key}'].filter((v) => v != null).join(';')}` +
-              ` ${SLOT_ATTR}={Astro.props['${INSTANCE_ATTR}'] == null ? '' : (Astro.props['${SLOT_ATTR}'] ?? '') + ';'}`,
+                ` ${SLOT_ATTR}={Astro.props['${INSTANCE_ATTR}'] == null ? '' : (Astro.props['${SLOT_ATTR}'] ?? '') + ';'}`,
             );
           } else {
             // Instance tag: both paths become props, forwarded to the
@@ -234,8 +266,15 @@ export function stampElementPaths(source: string): string {
           if (isComponentFile && node === root) {
             // Forward the usage site's instance path + slot status onto the
             // rendered root (both omitted by Astro when the props are absent).
-            stampAt(span, ` ${INSTANCE_ATTR}={Astro.props['${INSTANCE_ATTR}']} ${SLOT_ATTR}={Astro.props['${SLOT_ATTR}']}`);
+            stampAt(
+              span,
+              ` ${INSTANCE_ATTR}={Astro.props['${INSTANCE_ATTR}']} ${SLOT_ATTR}={Astro.props['${SLOT_ATTR}']}`,
+            );
           }
+        } else if (typeof type === 'string' && WRAPPABLE_TYPES.has(type)) {
+          // Islands / custom `.astro`: can't stamp the component tag, so wrap it
+          // in a path-carrying `display:contents` element (see WRAPPABLE_TYPES).
+          wrapAt(span, key, slotStamp);
         }
       }
       const children = node.children;
@@ -297,6 +336,16 @@ export function stampElementPaths(source: string): string {
  */
 export function xrayVitePlugin(projectRoot: string): Record<string, unknown> {
   const srcRoot = `${projectRoot.replace(/\\/g, '/').replace(/\/$/, '')}/src/`;
+  // Hand-authored custom `.astro` components are OPAQUE black boxes — Meno
+  // doesn't model their internals, so they must stay unstamped. Stamping them
+  // would put `data-element-path` on their inner elements, which then shadow the
+  // `<meno-x>` wrapper Meno splices around the usage site: a click inside the
+  // component resolves to a Custom-file-local path that maps to nothing in the
+  // editor tree (and never reaches the wrapper). The usage site IS selectable
+  // via that wrapper (stamped at the page/component that places the custom tag);
+  // the component body is not. (Islands dodge this for free — their source is
+  // `.tsx/.jsx/.vue/.svelte`, which this `.astro`-only hook never touches.)
+  const customRoot = `${srcRoot}custom/`;
   return {
     name: 'meno-astro:xray-paths',
     enforce: 'pre',
@@ -305,6 +354,8 @@ export function xrayVitePlugin(projectRoot: string): Record<string, unknown> {
       if (!id.endsWith('.astro') || id.includes('?')) return null;
       const normalized = id.replace(/\\/g, '/');
       if (normalized.includes('/node_modules/') || !normalized.startsWith(srcRoot)) return null;
+      // Never stamp opaque custom components (see customRoot doc above).
+      if (normalized.startsWith(customRoot)) return null;
       let source: string;
       try {
         source = readFileSync(id, 'utf-8');
@@ -325,9 +376,9 @@ export function xrayVitePlugin(projectRoot: string): Record<string, unknown> {
       // the function doc). A pre transform here runs after Astro's load (which
       // produced the CSS) and before Vite's own CSS pipeline.
       if (!id.includes('astro&type=style')) return null;
-      const normalized = id.split('?', 1)[0].replace(/\\/g, '/');
+      const normalized = (id.split('?', 1)[0] ?? '').replace(/\\/g, '/');
       if (normalized.includes('/node_modules/') || !normalized.startsWith(srcRoot)) return null;
-      const rewritten = rewriteViewportUnits(code);
+      const rewritten = rewriteViewportUnitsInStylesheet(code);
       return rewritten === code ? null : { code: rewritten, map: null };
     },
   };
@@ -511,7 +562,8 @@ export const XRAY_RESOLVER_JS = `
     // identity equals the target, copy-disambiguated by the target's item
     // path. No document-order fallback on mismatch: a hidden border is
     // strictly better than one on the wrong element.
-    function resolveTarget(t) {
+    function resolveTarget(t, scope) {
+      scope = scope || document;
       if (!KEY_RE.test(t.path)) return null;
       for (var v = 0; v < t.chain.length; v++) {
         if (!KEY_RE.test(t.chain[v])) return null;
@@ -523,7 +575,7 @@ export const XRAY_RESOLVER_JS = `
         // instance itself; a stacked root may carry further inner hops
         // (its wrapper), hence prefix-at-hop-boundary matching.
         var want = t.chain.concat([t.path]).join(';');
-        var roots = document.querySelectorAll('[${INSTANCE_ATTR}]');
+        var roots = scope.querySelectorAll('[${INSTANCE_ATTR}]');
         for (var k = 0; k < roots.length; k++) {
           var chain = walkChain(roots[k], '');
           if (!chain) continue;
@@ -536,7 +588,7 @@ export const XRAY_RESOLVER_JS = `
       // Valueless query + getAttribute compare: comma-bearing paths inside a
       // quoted attribute selector are valid CSS, but not every selector
       // engine agrees — and this sidesteps escaping concerns entirely.
-      var els = document.querySelectorAll('[data-element-path]');
+      var els = scope.querySelectorAll('[data-element-path]');
       for (var m = 0; m < els.length; m++) {
         if (els[m].getAttribute('data-element-path') !== t.path) continue;
         var id = identify(els[m]);
@@ -676,6 +728,28 @@ ${XRAY_SCROLL_JS}
       return box;
     }
 
+    // Bounding rect of a resolved target. Islands / custom nodes are anchored to
+    // a 'display:contents' wrapper (see WRAPPABLE_TYPES) which generates no box of
+    // its own — getBoundingClientRect returns an empty rect. Fall back to the
+    // union of the wrapper's rendered descendants so the highlight still draws,
+    // mirroring studio's XRayOverlay.
+    function rectOf(el) {
+      var r = el.getBoundingClientRect();
+      if (r.width > 0 || r.height > 0) return r;
+      var kids = el.querySelectorAll('*');
+      var left = Infinity, top = Infinity, right = -Infinity, bottom = -Infinity, found = false;
+      for (var i = 0; i < kids.length; i++) {
+        var kr = kids[i].getBoundingClientRect();
+        if (kr.width === 0 && kr.height === 0) continue;
+        found = true;
+        if (kr.left < left) left = kr.left;
+        if (kr.top < top) top = kr.top;
+        if (kr.right > right) right = kr.right;
+        if (kr.bottom > bottom) bottom = kr.bottom;
+      }
+      return found ? { left: left, top: top, width: right - left, height: bottom - top } : r;
+    }
+
     function frame() {
       raf = 0;
       var c = ensureContainer();
@@ -687,7 +761,7 @@ ${XRAY_SCROLL_JS}
           if (!t.el || !t.el.isConnected) t.el = resolveTarget(t);
           var box = c.children[i + 1];
           if (!t.el) { box.style.display = 'none'; continue; }
-          var r = t.el.getBoundingClientRect();
+          var r = rectOf(t.el);
           var color = t.isComponent ? GREEN : BLUE;
           var selected = t.kind === 'selected';
           box.style.display = 'block';
@@ -716,7 +790,7 @@ ${XRAY_SCROLL_JS}
         // next mouseover refreshes the anchor.
         if (altHoverEl && !altHoverEl.isConnected) altHoverEl = null;
         if (altHoverEl) {
-          var ar = altHoverEl.getBoundingClientRect();
+          var ar = rectOf(altHoverEl);
           altBox.style.display = 'block';
           altBox.style.left = ar.left + 'px';
           altBox.style.top = ar.top + 'px';
@@ -965,7 +1039,7 @@ ${XRAY_SCROLL_JS}
         var t = commentTargets[i];
         if (!t.el || !t.el.isConnected) t.el = resolveTarget(t);
         if (!t.el) continue;
-        var r = t.el.getBoundingClientRect();
+        var r = rectOf(t.el);
         rects.push({ id: t.id, left: r.left, top: r.top, width: r.width, height: r.height });
       }
       var snap = JSON.stringify(rects);
@@ -1018,7 +1092,23 @@ ${XRAY_SCROLL_JS}
         e.stopPropagation();
         var id = identify(e.target);
         if (!id) return;
-        post({ type: '${PLAY_COMMENT_PLACE_MESSAGE_TYPE}', chain: id.chain, path: id.path, item: id.item });
+        // Place the pin WHERE the user clicked, not at the element's center. The
+        // editor collapses a page-level play click to instance granularity (the
+        // outermost component instance when the click is inside one, else the
+        // clicked element itself), so resolve THAT same element — the one the pin
+        // streams its rect for — and express the click as a 0..1 fraction of its
+        // rect. The twin of the same-origin resolveCommentAnchorFromClick; falls
+        // back to center if the anchor element can't be resolved.
+        var anchorEl = id.chain.length > 0
+          ? resolveTarget({ chain: [], path: id.chain[0], item: id.item, isComponent: true })
+          : resolveTarget({ chain: [], path: id.path, item: id.item, isComponent: false });
+        var offsetX = 0.5, offsetY = 0.5;
+        if (anchorEl) {
+          var ar = rectOf(anchorEl);
+          if (ar.width > 0) offsetX = Math.min(1, Math.max(0, (e.clientX - ar.left) / ar.width));
+          if (ar.height > 0) offsetY = Math.min(1, Math.max(0, (e.clientY - ar.top) / ar.height));
+        }
+        post({ type: '${PLAY_COMMENT_PLACE_MESSAGE_TYPE}', chain: id.chain, path: id.path, item: id.item, offsetX: offsetX, offsetY: offsetY });
       },
       true
     );

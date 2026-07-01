@@ -1,0 +1,25 @@
+---
+/**
+ * Markdown.astro — the runtime component emitted for a `{ type: "markdown" }` node
+ * (see dialect/emit/emitNode.ts:renderMarkdown). The emitter passes the verbatim Markdown
+ * `source` (usually a hoisted `__mdN` backtick const), plus an optional `class` and any other
+ * HTML attributes. The Markdown is rendered to HTML here via `renderMarkdown` and dropped into
+ * a wrapper `<div>` with `set:html` — parity with meno-core's SSR markdown-node renderer
+ * (which wraps the same HTML in a `<div>`), so the editor canvas and the real Astro build
+ * render identically.
+ *
+ * Author-trusted content (the editor is the source of truth) → `set:html`, matching the
+ * embed / customCode paths.
+ */
+import { renderMarkdown } from 'meno-astro';
+
+interface Props {
+  source?: string;
+  class?: string;
+  [attr: string]: unknown;
+}
+
+const { source, class: className, ...rest } = Astro.props;
+const html = renderMarkdown(source);
+---
+<div class={className} {...rest} set:html={html}></div>

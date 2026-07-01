@@ -1,7 +1,7 @@
 /**
  * meno-astro/components — the runtime `.astro` components emitted pages/components import.
  *
- * Emitted markup uses `import { BaseLayout, Link, Embed, LocaleList } from
+ * Emitted markup uses `import { BaseLayout, Link, Embed, LocaleList, MenoImage, Markdown } from
  * 'meno-astro/components'` (see dialect/emit/frontmatter.ts component-import lines). This
  * barrel re-exports each `.astro` file as a named export so those imports resolve.
  *
@@ -14,3 +14,5 @@ export { default as BaseLayout } from './BaseLayout.astro';
 export { default as Link } from './Link.astro';
 export { default as Embed } from './Embed.astro';
 export { default as LocaleList } from './LocaleList.astro';
+export { default as MenoImage } from './MenoImage.astro';
+export { default as Markdown } from './Markdown.astro';

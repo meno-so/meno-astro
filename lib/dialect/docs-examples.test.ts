@@ -202,10 +202,10 @@ describe('docs: pinned emit encodings (claims in the spec)', () => {
         structure: { type: 'node', tag: 'span', children: '{{text}}' },
       },
     } as any);
-    // One import line of the runtime helpers (`style` rides along — the structure root
-    // always calls style() to merge the incoming instance class), no MenoProps type
+    // One import line of the runtime helpers (`cx` rides along — the style-less structure
+    // root emits `cx(className)` to merge the incoming instance class), no MenoProps type
     // import, no interface Props / __meno_props.
-    expect(src).toContain("import { resolveProps, style } from 'meno-astro';");
+    expect(src).toContain("import { cx, resolveProps } from 'meno-astro';");
     expect(src).not.toContain('interface Props');
     expect(src).not.toContain('__meno_props');
     expect(src).not.toContain('Astro.props');
@@ -230,12 +230,17 @@ describe('docs: pinned emit encodings (claims in the spec)', () => {
         type: 'node',
         tag: 'a',
         style: { base: { color: 'red' } },
-        interactiveStyles: [{ name: 'onHover', postfix: ':hover', style: { base: { opacity: '0.8' } } }],
+        // A context-prefixed rule is NOT convertible to a variant class, so it stays in the
+        // style() interactive meta (a convertible bare `:hover` would lower to a `hover:` token).
+        interactiveStyles: [
+          { name: 'onHover', prefix: '.is-dark ', postfix: ':hover', style: { base: { opacity: '0.8' } } },
+        ],
         label: 'cta',
         generateElementClass: true,
       }),
     );
-    expect(src).toContain('class={style(');
+    // The `<a>` is the structure root → style() is wrapped in the cx instance-merge form.
+    expect(src).toContain('class={cx(style(');
     expect(src).toContain('interactive:');
     expect(src).toContain('label: "cta"');
     expect(src).toContain('genClass: true');
@@ -251,6 +256,43 @@ describe('docs: pinned emit encodings (claims in the spec)', () => {
     const src = emit(comp({ type: 'embed', html: '<svg>\n  <path d="M0 0"/>\n</svg>' }));
     expect(src).toContain('const __embed0 = `');
     expect(src).toContain('html={__embed0}');
+  });
+
+  test('§4.4 a hand-authored embed hoist under a non-__embedN name is recovered, not lost', () => {
+    // The codec's canonical hoist name is `__embedN`, but an author may name the const
+    // anything. Parse must resolve `html={__iconChat}` to the verbatim SVG (not a phantom
+    // `{{__iconChat}}` binding), and emit must re-hoist it as `__embed0` — name normalizes,
+    // HTML survives. Regression guard for the silent-SVG-loss round-trip bug.
+    const authored = [
+      '---',
+      'const __iconChat = `<svg width="10" height="10">',
+      '<path d="M0 0" />',
+      '</svg>`;',
+      'const { class: className } = resolveProps(Astro, {});',
+      '---',
+      '<div class={className}>',
+      '  <Embed html={__iconChat} />',
+      '</div>',
+      '',
+    ].join('\n');
+
+    const { model } = parse(authored);
+    // The SVG is recovered verbatim into the embed node — NOT misread as a binding.
+    const svg = '<svg width="10" height="10">\n<path d="M0 0" />\n</svg>';
+    const embed = (model as any).component.structure.children[0];
+    expect(embed).toEqual({ type: 'embed', html: svg });
+    expect(JSON.stringify(model)).not.toContain('{{__iconChat}}');
+
+    // Emit normalizes the const NAME to `__embed0` while preserving the HTML, and never
+    // re-emits the custom name as a bogus prop destructure.
+    const out = emit(model);
+    expect(out).toContain('const __embed0 = `');
+    expect(out).toContain('html={__embed0}');
+    expect(out).toContain('<path d="M0 0" />');
+    expect(out).not.toContain('__iconChat');
+
+    // Stable thereafter (the recovered model is already canonical).
+    expect(parse(emit(model)).model).toEqual(model as any);
   });
 
   test('defineVars: true emits native <script define:vars={{…}}> (all interface props) and keeps it out of __meno', () => {
@@ -380,6 +422,80 @@ describe('docs: pinned emit encodings (claims in the spec)', () => {
     // so an { _i18n, … } field would otherwise interpolate as "[object Object]" (identity
     // for plain values like _id).
     expect(src).toContain('data-id={i18n(item._id) || undefined}');
+  });
+
+  test('legacy `collection`-field list (no source) → promoted to source + sourceType, loop bound to `item`', () => {
+    // A `type:"list"` node that still carries the deprecated `collection` field (and no
+    // `source`) used to crash emit: singularize(undefined) → "undefined is not an object
+    // (evaluating 'collection.endsWith')". normalize.ts migrateLegacy now promotes the
+    // string `collection` to `source`, infers sourceType:"collection", and binds the loop to
+    // `item` (legacy collection-list children reference {{item.*}}).
+    const src = emit(
+      comp({
+        type: 'list',
+        sourceType: 'collection',
+        collection: 'case-study-category',
+        children: [{ type: 'node', tag: 'span', children: '{{item.title}}' }],
+      }),
+    );
+    expect(src).toContain('await getCollectionList("case-study-category"');
+    expect(src).toContain('.map((item, itemIndex)');
+    expect(src).toContain('<span>{i18n(item.title)}</span>');
+  });
+
+  test('collection name that is not a JS identifier → singularize sanitizes the loop var (case-study → caseStudy)', () => {
+    // A collection list with an explicit `source` whose name has a hyphen and no itemAs:
+    // the default loop var was singularize("case-study") === "case-study", an invalid `.map`
+    // arg. singularize() now coerces it to a valid identifier so the emitted JS parses.
+    const src = emit(
+      comp({
+        type: 'list',
+        sourceType: 'collection',
+        source: 'case-study',
+        children: [{ type: 'node', tag: 'span', children: '{{caseStudy.title}}' }],
+      }),
+    );
+    expect(src).toContain('await getCollectionList("case-study"'); // real collection name kept
+    expect(src).toContain('.map((caseStudy, caseStudyIndex)'); // loop var is a valid identifier
+    expect(src).not.toContain('case-study, '); // no invalid hyphenated `.map` arg
+  });
+
+  test('prop named `list` does not shadow the `list()` helper — import is aliased, round-trips', () => {
+    // A list component conventionally names its items prop `list` (`source: "{{list}}"`).
+    // The destructured `const { list } = __props` would shadow the imported `list()` helper,
+    // so `list(list)` calls the Array → runtime "list is not a function". Emit aliases the
+    // helper import (`list as list$`) and calls `list$(list)`; the prop reference stays bare.
+    const model = {
+      component: {
+        interface: { list: { type: 'list', itemSchema: {}, default: [] } },
+        structure: {
+          type: 'list',
+          sourceType: 'prop',
+          source: '{{list}}',
+          children: [{ type: 'node', tag: 'span', children: '{{item.title}}' }],
+        },
+      },
+    };
+    const src = emit(model as any);
+    expect(src).toContain("import { list as list$, resolveProps } from 'meno-astro';");
+    expect(src).toContain('const { list, class: className } = __props;');
+    expect(src).toContain('{list$(list).map((item, itemIndex) => (');
+    expect(src).not.toMatch(/[^A-Za-z0-9_$.]list\(list/); // no un-aliased collision
+    assertRoundTrip(model); // parse resolves the `list as list$` alias back to the prop source
+  });
+
+  test('a prop-list whose prop is NOT a helper name imports `list` plainly (no needless alias)', () => {
+    const src = emit(
+      comp({
+        type: 'list',
+        sourceType: 'prop',
+        source: '{{items}}',
+        children: [{ type: 'node', tag: 'span', children: '{{item.title}}' }],
+      }),
+    );
+    expect(src).toContain("import { list, resolveProps } from 'meno-astro';");
+    expect(src).toContain('{list(items).map((item, itemIndex) => (');
+    expect(src).not.toContain('list as'); // no alias when there's no collision
   });
 
   test('§6.4 CMS-data bindings wrap in i18n(): emit forms + the parse disambiguation table', () => {

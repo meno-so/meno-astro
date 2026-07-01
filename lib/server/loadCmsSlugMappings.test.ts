@@ -1,12 +1,8 @@
 import { test, expect, describe, afterEach } from 'bun:test';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from 'fs';
-import { tmpdir } from 'os';
-import { join, dirname } from 'path';
-import {
-  loadCmsSlugMappings,
-  resolveCmsEntrySlug,
-  clearCmsSlugMappingsCache,
-} from './loadCmsSlugMappings';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { loadCmsSlugMappings, resolveCmsEntrySlug, clearCmsSlugMappingsCache } from './loadCmsSlugMappings';
 import { loadSlugMappings, clearSlugMappingsCache } from './loadSlugMappings';
 import type { CmsAwareSlugMap } from '../runtime/localeRoutes';
 
@@ -82,7 +78,7 @@ describe('loadCmsSlugMappings', () => {
     });
   });
 
-  test('missing slug field → filename fallback (the boilerplate\'s `?? entry.id` contract)', () => {
+  test("missing slug field → filename fallback (the boilerplate's `?? entry.id` contract)", () => {
     const root = projectWith({
       'project.config.json': I18N,
       'src/pages/blog/[slug].astro': BLOG_TEMPLATE,
@@ -315,11 +311,9 @@ describe('resolveCmsEntrySlug', () => {
         `{ id: "work", slugField: "urlSlug", urlPattern: "/work/{{slug}}", fields: {} }`,
       ),
     });
-    expect(
-      atRoot(root, () => resolveCmsEntrySlug({ urlSlug: { _i18n: true, en: 'case' } }, 'work')),
-    ).toEqual({ urlSlug: 'case' });
-    expect(
-      atRoot(root, () => resolveCmsEntrySlug({ slug: { _i18n: true, en: 'x' } }, 'nope')),
-    ).toEqual({ slug: 'x' });
+    expect(atRoot(root, () => resolveCmsEntrySlug({ urlSlug: { _i18n: true, en: 'case' } }, 'work'))).toEqual({
+      urlSlug: 'case',
+    });
+    expect(atRoot(root, () => resolveCmsEntrySlug({ slug: { _i18n: true, en: 'x' } }, 'nope'))).toEqual({ slug: 'x' });
   });
 });

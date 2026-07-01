@@ -144,9 +144,7 @@ describe('enumerate404LocaleStaticPaths', () => {
   });
 
   test('the default locale is never enumerated (Astro builds dist/404.html itself)', () => {
-    expect(
-      enumerate404LocaleStaticPaths(true, CONFIG).some((p) => p.params.locale === 'en'),
-    ).toBe(false);
+    expect(enumerate404LocaleStaticPaths(true, CONFIG).some((p) => p.params.locale === 'en')).toBe(false);
   });
 
   test('pageId resolves to the 404 page module (LocaleRoute glob contract)', () => {
@@ -162,9 +160,7 @@ describe('enumerate404LocaleStaticPaths', () => {
     expect(buildHreflangLinks('/pl/404/', 'pl', CONFIG, MAPPINGS, 'https://x.test')).toEqual([]);
     //   and no slug-map entry means the page enumeration never emits a 404 path of
     //   its own (the switcher's links are slug-map-driven the same way).
-    expect(
-      enumerateLocaleStaticPaths(MAPPINGS, CONFIG).some((p) => p.props.pageId === '404'),
-    ).toBe(false);
+    expect(enumerateLocaleStaticPaths(MAPPINGS, CONFIG).some((p) => p.props.pageId === '404')).toBe(false);
   });
 });
 
@@ -254,9 +250,7 @@ describe('buildHreflangLinks', () => {
       { hreflang: 'x-default', href: '/blog/my-post' },
     ]);
     // Pages keep the fallback advertisement (about has no de slug but /de/about IS built).
-    expect(
-      buildHreflangLinks('/about', 'en', CONFIG, merged).some((l) => l.hreflang === 'de-DE'),
-    ).toBe(true);
+    expect(buildHreflangLinks('/about', 'en', CONFIG, merged).some((l) => l.hreflang === 'de-DE')).toBe(true);
   });
 
   test('percent-encoded pathnames (Astro.url.pathname) still resolve non-ASCII slugs', () => {
@@ -283,7 +277,9 @@ describe('buildHreflangLinks', () => {
       { hreflang: 'de-DE', href: '/de/about' },
       { hreflang: 'x-default', href: '/about' },
     ]);
-    expect(buildHreflangLinks('/pl/o-nas/', 'pl', CONFIG, MAPPINGS).find((l) => l.hreflang === 'en-US')?.href).toBe('/about');
+    expect(buildHreflangLinks('/pl/o-nas/', 'pl', CONFIG, MAPPINGS).find((l) => l.hreflang === 'en-US')?.href).toBe(
+      '/about',
+    );
   });
 
   test('single-locale or empty mappings → []', () => {

@@ -33,6 +33,7 @@ import { extractLocaleFromPath } from 'meno-core/shared';
 import { buildHreflangLinks } from '../runtime/localeRoutes';
 import type { I18nConfig } from 'meno-core/shared';
 import type { SlugMap } from 'meno-core/shared';
+import type { SitemapMeta } from '../server/loadSitemapMeta';
 
 /** The slice of Astro's `astro:build:done` `pages` entries the sitemap consumes. */
 export interface SitemapPage {
@@ -48,13 +49,15 @@ export interface SitemapPage {
  * Astro 5 directory format yields `''` / `'about/'` / `'pl/o-nas/'` / `'404/'`.)
  */
 function normalizePagePath(pathname: string): string {
-  return pathname
-    .replace(/[?#].*$/, '') // defensive: a query/hash is never part of a built path
-    // Anchored to a path boundary: bare `index.html$` would truncate any page whose
-    // final segment merely ENDS in "index.html" (`zindex.html` under
-    // `build.format: 'file'` → "z").
-    .replace(/(^|\/)index\.html$/, '$1')
-    .replace(/^\/+|\/+$/g, '');
+  return (
+    pathname
+      .replace(/[?#].*$/, '') // defensive: a query/hash is never part of a built path
+      // Anchored to a path boundary: bare `index.html$` would truncate any page whose
+      // final segment merely ENDS in "index.html" (`zindex.html` under
+      // `build.format: 'file'` → "z").
+      .replace(/(^|\/)index\.html$/, '$1')
+      .replace(/^\/+|\/+$/g, '')
+  );
 }
 
 /**
@@ -90,6 +93,8 @@ function escapeXml(value: string): string {
  * @param siteUrl  The project's public origin (`loadSiteUrl`; trailing slash trimmed).
  * @param config   The project i18n config (`loadI18nConfig`) — drives alternates.
  * @param mappings The project slug map (`loadSlugMappings`) — routes localized URLs.
+ * @param sitemapMeta Per-page settings keyed by normalized route path (`loadSitemapMeta`):
+ *          `exclude` drops the URL; `priority`/`changefreq` annotate it. Optional.
  * @returns The XML document, or `null` when there is nothing to write (no pages, or
  *          only excluded error routes) — the hook then writes no file at all rather
  *          than an empty `<urlset>`.
@@ -99,10 +104,12 @@ export function buildSitemapXml(
   siteUrl: string,
   config: I18nConfig,
   mappings: SlugMap[],
+  sitemapMeta?: Map<string, SitemapMeta>,
 ): string | null {
-  // Dedupe (defensive: hook params are external input) + drop error routes.
+  // Dedupe (defensive: hook params are external input) + drop error routes + per-page
+  // `exclude` (a page the author marked "exclude from sitemap" — every locale variant).
   const paths = [...new Set(pages.map((p) => normalizePagePath(p.pathname)))].filter(
-    (p) => !isErrorRoute(p, config),
+    (p) => !isErrorRoute(p, config) && !sitemapMeta?.get(p)?.exclude,
   );
   if (paths.length === 0) return null;
   // Sorted for deterministic output (meno-core generateSitemap parity).
@@ -116,14 +123,18 @@ export function buildSitemapXml(
     // the same slug-map resolution BaseLayout's hreflang uses. Single-locale projects,
     // unroutable paths, and empty maps all yield [] → a plain <url>.
     const { locale } = extractLocaleFromPath(route, config);
-    const alternates = buildHreflangLinks(
-      route,
-      locale ?? config.defaultLocale,
-      config,
-      mappings,
-      siteUrl,
-    );
-    if (alternates.length === 0) return `  <url><loc>${escapeXml(loc)}</loc></url>`;
+    const alternates = buildHreflangLinks(route, locale ?? config.defaultLocale, config, mappings, siteUrl);
+    // Optional <changefreq>/<priority> from the page's meta.sitemap (sitemaps.org order:
+    // loc, changefreq, priority, then the xhtml:link alternates extension).
+    const m = sitemapMeta?.get(path);
+    const annot =
+      (m?.changefreq ? `\n    <changefreq>${m.changefreq}</changefreq>` : '') +
+      (m?.priority !== undefined ? `\n    <priority>${m.priority}</priority>` : '');
+    if (alternates.length === 0) {
+      return annot
+        ? `  <url>\n    <loc>${escapeXml(loc)}</loc>${annot}\n  </url>`
+        : `  <url><loc>${escapeXml(loc)}</loc></url>`;
+    }
     hasAlternates = true;
     const links = alternates
       .map(
@@ -131,7 +142,7 @@ export function buildSitemapXml(
           `    <xhtml:link rel="alternate" hreflang="${escapeXml(hreflang)}" href="${escapeXml(href)}"/>`,
       )
       .join('\n');
-    return `  <url>\n    <loc>${escapeXml(loc)}</loc>\n${links}\n  </url>`;
+    return `  <url>\n    <loc>${escapeXml(loc)}</loc>${annot}\n${links}\n  </url>`;
   });
 
   // The xhtml namespace is declared only when an <xhtml:link> actually uses it.

@@ -28,21 +28,15 @@
  * Class-name computation is meno-core's, the same code the JSON runtime uses:
  *   - `responsiveStylesToClasses` — the forward mapper that turns a resolved style into
  *     utility class names (byte-identical to meno-core's ComponentBuilder).
- *   - `shortHash` — meno-core's deterministic djb2 hash, so an interactive style maps to
+ *   - `shortHash` — meno-core's deterministic FNV-1a hash, so an interactive style maps to
  *     a stable, element-scoped class the build-time scan can match.
  *   - `isStyleMapping` — the `_mapping` type guard; mapping *resolution* mirrors
  *     meno-core's `resolveExtractedMappings` (`mapping.values[String(propValue)]`).
  */
 
-// Narrow `meno-core/shared/*` subpath imports (the same convention `runtime/i18n.ts`
-// uses) rather than the broad `meno-core` barrel — the barrel re-exports the whole
-// shared surface, dragging unrelated modules (and their latent type errors) into this
-// package's type-check graph. We only need the style pipeline.
-import { DEFAULT_BREAKPOINTS, type BreakpointConfig } from 'meno-core/shared';
 // The reverse mapper (class → { prop, value }) — used to key classes by CSS property for
 // the instance-over-root merge (see mergeInstanceClasses).
 import { classToStyle } from 'meno-core/shared';
-import { generateInteractiveCSS } from 'meno-core/shared';
 import { isStyleMapping } from 'meno-core/shared';
 import { shortHash } from 'meno-core/shared';
 // The SAME forward mapper meno-core's JSON runtime (ComponentBuilder) uses — so the
@@ -242,7 +236,7 @@ function sanitizeLabel(label: string): string {
  * Compute a deterministic class name from the *resolved* style payload (base style +
  * interactive rules) plus the optional label. Identical inputs ⇒ identical class, so
  * two `style()` calls with the same styleObject dedupe to one CSS rule. The hash uses
- * meno-core's `shortHash` (djb2). A label prefix is added for human-readable selectors
+ * meno-core's `shortHash` (FNV-1a). A label prefix is added for human-readable selectors
  * but the hash still keys dedup, so distinct styles never collide on label alone.
  */
 export function computeClassName(
@@ -267,11 +261,17 @@ export function computeClassName(
  * never participate in conflict detection and are always kept.
  */
 function classMergeKey(cls: string): string | null {
-  // Breakpoint variant prefix (`tablet:p-[10px]`) — the segment before the
+  // Breakpoint variant prefix (`max-tablet:p-[10px]`) — the segment before the
   // first colon, when it's a bare identifier (arbitrary-property classes like
   // `[grid-area:hero]` and var hints like `text-(length:--x)` never match).
   const variantMatch = cls.match(/^([a-z][a-z0-9_-]*):/);
-  const bp = variantMatch ? variantMatch[1] : '';
+  // Normalize so every breakpoint form shares a merge key — an instance's `max-lg:p-4` must override a
+  // root's `max-tablet:p-4` or legacy `tablet:p-4`. Strip the desktop-first marker, then fold the
+  // Tailwind-scale class alias back to the identity (lg→tablet, sm→mobile). Mirrors meno-core's
+  // normalizeBreakpointVariant, inlined to keep the published runtime off a new meno-core export.
+  let bp = (variantMatch ? variantMatch[1]! : '').replace(/^max-/, '');
+  if (bp === 'lg') bp = 'tablet';
+  else if (bp === 'sm') bp = 'mobile';
   const entry = classToStyle(cls);
   return entry ? `${bp}|${entry.prop}` : null;
 }
@@ -288,7 +288,7 @@ function classMergeKey(cls: string): string | null {
 export function mergeInstanceClasses(own: string[], instanceClass: string): string[] {
   const instance = instanceClass.split(/\s+/).filter(Boolean);
   if (instance.length === 0) return own;
-  const overridden = new Set(instance.map(classMergeKey).filter(Boolean) as string[]);
+  const overridden = new Set(instance.map(classMergeKey).filter((k): k is string => k !== null));
   const kept = own.filter((cls) => {
     const key = classMergeKey(cls);
     return key === null || !overridden.has(key);
@@ -364,7 +364,7 @@ export function style(
 
 /** camelCase → kebab-case CSS property (idempotent for already-kebab keys). */
 function cssKebab(key: string): string {
-  return key.replace(/[A-Z]/g, (m) => '-' + m.toLowerCase());
+  return key.replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`);
 }
 
 /**
@@ -380,14 +380,26 @@ function cssKebab(key: string): string {
  */
 function instanceOverriddenCssProps(props?: Record<string, unknown>): Set<string> {
   const out = new Set<string>();
+  // (a) Instance override carried as a style OBJECT (`__menoStyle`, the legacy/dynamic form).
   const styleObj = props?.__menoStyle as StyleValue | undefined;
-  if (!styleObj || typeof styleObj !== 'object') return out;
-  const flat = isResponsive(styleObj) ? styleObj.base : (styleObj as StyleObject);
-  if (!flat || typeof flat !== 'object') return out;
-  for (const [k, v] of Object.entries(flat)) {
-    if (v === undefined || v === null || v === '') continue;
-    if (typeof v === 'string' && v.includes('{{')) continue; // template → no class, don't suppress
-    out.add(cssKebab(k));
+  if (styleObj && typeof styleObj === 'object') {
+    const flat = isResponsive(styleObj) ? styleObj.base : (styleObj as StyleObject);
+    if (flat && typeof flat === 'object') {
+      for (const [k, v] of Object.entries(flat)) {
+        if (v === undefined || v === null || v === '') continue;
+        if (typeof v === 'string' && v.includes('{{')) continue; // template → no class, don't suppress
+        out.add(cssKebab(k));
+      }
+    }
+  }
+  // (b) Instance override carried as a class STRING (the class-based form — `<Child class="p-[24px]" />`).
+  // Decode each base-level (unprefixed) utility token to the CSS property it overrides, so the root's
+  // prop-bound inline style for that property is still dropped (instance class must win over inline).
+  const cls = typeof props?.class === 'string' ? (props.class as string) : '';
+  for (const token of cls.split(/\s+/)) {
+    if (!token || /^[a-z][a-z0-9_-]*:/.test(token)) continue; // skip blanks + breakpoint variants
+    const entry = classToStyle(token);
+    if (entry) out.add(cssKebab(entry.prop));
   }
   return out;
 }
@@ -416,4 +428,55 @@ export function inlineStyle(decls: Record<string, string>, props?: Record<string
     out.push(`${cssProp}: ${value}`);
   }
   return out.length ? out.join('; ') : undefined;
+}
+
+// ---------------------------------------------------------------------------
+// cx() / variants() — class-based prop-driven styling (class form of `_mapping`).
+// ---------------------------------------------------------------------------
+
+/**
+ * Concatenate utility-class fragments into one class string, dropping empty parts and, when two
+ * fragments target the same (breakpoint, CSS property), keeping the LAST (later args win — callers
+ * order base-then-override). Conflict-aware via the same `classMergeKey` used for instance merging,
+ * so a variant class cleanly overrides a base one without relying on stylesheet order (spec §8).
+ */
+export function cx(...parts: Array<string | false | null | undefined>): string {
+  const tokens: string[] = [];
+  for (const part of parts) {
+    if (!part) continue;
+    for (const t of String(part).split(/\s+/)) if (t) tokens.push(t);
+  }
+  if (tokens.length < 2) return tokens.join(' ');
+  const lastForKey = new Map<string, number>();
+  tokens.forEach((t, i) => {
+    const k = classMergeKey(t);
+    if (k) lastForKey.set(k, i);
+  });
+  return tokens
+    .filter((t, i) => {
+      const k = classMergeKey(t);
+      return k === null || lastForKey.get(k) === i;
+    })
+    .join(' ');
+}
+
+/**
+ * Resolve a prop-driven variant table to the active utility class(es). `table` maps a PROP name to
+ * a `{ propValue: "utility classes" }` lookup — the class form of a `_mapping` (the values are
+ * utility classes, not CSS). For each prop the class for the current `props[prop]` value is picked
+ * (string-coerced). The class analogue of meno-core's `resolveStyleMapping`; a missing/unmatched
+ * value contributes nothing.
+ */
+export function variants(
+  props: Record<string, unknown> | undefined,
+  table: Record<string, Record<string, string>>,
+): string {
+  const out: string[] = [];
+  for (const [prop, lookup] of Object.entries(table)) {
+    const value = props?.[prop];
+    if (value === undefined || value === null) continue;
+    const cls = lookup[String(value)];
+    if (cls) out.push(cls);
+  }
+  return out.join(' ');
 }

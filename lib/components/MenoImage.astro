@@ -1,0 +1,59 @@
+---
+/**
+ * MenoImage.astro — the runtime component emitted for an optimized image
+ * (`<img data-meno-optimize="true">` → dialect/emit/emitNode.ts:renderMenoImage).
+ *
+ * It bridges Meno's STRING image srcs to Astro's `astro:assets` `<Image>`. Astro's `<Image>`
+ * wants an ESM-imported asset (auto width/height + processing) or, for a string src, an
+ * explicit `width`+`height`. Meno srcs are root-absolute asset-bridge paths (`/images/hero.png`,
+ * served by the meno() integration / copied into `dist/`) or remote URLs — never ESM imports —
+ * so this wrapper picks the form that always builds and optimizes where Astro can:
+ *
+ *   - LOCAL src + width & height → `<Image>` with those dims. Astro adds `loading="lazy"` +
+ *     `decoding="async"` and optimizes when the source is processable; a public/bridged path
+ *     renders as a correctly-sized `<img>` (CLS-safe) even though Astro can't pixel-optimize
+ *     a dimensionless public file.
+ *   - REMOTE src (any) → a plain `<img>` (with dims when known, for CLS-safety). Astro's
+ *     `<Image>` REFUSES a remote host that isn't allow-listed in `image.domains`/`remotePatterns`
+ *     and throws `RemoteImageNotAllowed` at render/build time. Meno projects reference remote
+ *     images from arbitrary CDNs (imported sites) with no per-host config, and a prop-bound
+ *     `src` can only be known to be remote at runtime — so never route a remote URL through
+ *     `<Image>`. This mirrors the emit-side policy (a remote `<img>` is not auto-optimized;
+ *     see dialect/emit — imageOptimize.test.ts "a REMOTE <img> is NOT optimized by default").
+ *   - LOCAL src + no dims → a plain lazy `<img>` — Astro can't optimize a dimensionless
+ *     public path, so degrade gracefully rather than fail the build.
+ *
+ * `alt` is always passed (Astro `<Image>` throws on a missing alt) — defaults to "". All other
+ * attributes (`class`, inline `style`, `data-*`, an explicit `loading`, …) pass through.
+ * (`width`/`height` that are `undefined` are dropped by Astro's attribute serialization.)
+ *
+ * NOTE: genuine pixel optimization of LOCAL Meno images is limited by the asset-bridge model
+ * (images live outside `src/`, so they can't be ESM-imported for processing). This wrapper
+ * therefore gives local images lazy-loading + dimension hints; remote images pass through
+ * untouched. True local optimization would require relocating images under `src/`.
+ */
+import { Image } from 'astro:assets';
+
+interface Props {
+  src?: unknown;
+  alt?: unknown;
+  width?: unknown;
+  height?: unknown;
+  [attr: string]: unknown;
+}
+
+const { src: rawSrc, alt: rawAlt, width: rawWidth, height: rawHeight, ...rest } = Astro.props;
+const src = typeof rawSrc === 'string' ? rawSrc : '';
+const alt = typeof rawAlt === 'string' ? rawAlt : '';
+const width = rawWidth != null && rawWidth !== '' ? Number(rawWidth) : undefined;
+const height = rawHeight != null && rawHeight !== '' ? Number(rawHeight) : undefined;
+const hasDims = Number.isFinite(width) && Number.isFinite(height);
+const isRemote = /^https?:\/\//.test(src);
+---
+{
+  !isRemote && hasDims ? (
+    <Image src={src} alt={alt} width={width} height={height} {...rest} />
+  ) : (
+    <img src={src} alt={alt} width={width} height={height} loading="lazy" decoding="async" {...rest} />
+  )
+}

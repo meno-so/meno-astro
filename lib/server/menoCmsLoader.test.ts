@@ -28,12 +28,15 @@ function setup(files: Record<string, unknown>, opts: { dev: boolean }) {
   const watch: { added: string[]; handlers: Record<string, (p: string) => void> } = { added: [], handlers: {} };
   const ctx = {
     store: {
-      set: ({ id, data }: { id: string; data: Record<string, unknown> }) => (store.set(id, data), true),
+      set: ({ id, data }: { id: string; data: Record<string, unknown> }) => {
+        store.set(id, data);
+        return true;
+      },
       clear: () => store.clear(),
     },
     parseData: async ({ data }: { id: string; data: Record<string, unknown> }) => data,
     generateDigest: (d: unknown) => JSON.stringify(d),
-    config: { root: pathToFileURL(root + '/') },
+    config: { root: pathToFileURL(`${root}/`) },
     watcher: opts.dev
       ? {
           add: (p: string) => watch.added.push(p),
@@ -101,7 +104,7 @@ describe('menoCmsLoader', () => {
     const { store, ctx, root, dir, watch } = setup({ 'a.json': { _id: 'a', slug: 'a' } }, { dev: true });
     await loader.load(ctx);
     expect(store.size).toBe(1); // initial sync
-    const reload = watch.handlers.change;
+    const reload = watch.handlers.change!;
     expect(typeof reload).toBe('function');
     expect(watch.added).toContain(dir);
 

@@ -21,8 +21,8 @@
  * the same unchanged file once per page.
  */
 
-import { readFileSync, statSync } from 'fs';
-import { join } from 'path';
+import { readFileSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 
 /** Per-project mtime memo (see `loadI18nConfig` for the rationale). */
 const cache = new Map<string, { mtimeMs: number; siteUrl: string | null }>();

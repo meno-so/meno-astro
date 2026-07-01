@@ -12,10 +12,12 @@
  *                  inside `{ … }`.
  */
 
-import { singularize } from 'meno-core/shared';
+import type { ResponsiveStyleObject } from 'meno-core/shared';
+import { singularize, responsiveStylesToClasses, splitVariantPrefix } from 'meno-core/shared';
+import { decodeVariantClass } from '../variantClass';
 import { serializeLiteral } from './serialize';
 import { type EmitContext, needRuntime, needRuntimeComponent } from './emitContext';
-import { isRichTextHtml, stripMenoSpanMarker } from '../richtext';
+import { hasRawHtmlPrefix, isRichTextHtml, stripMenoSpanMarker, stripRawHtmlPrefix } from '../richtext';
 import { templateVarName } from '../../runtime/cssValue';
 
 type Node = Record<string, any>;
@@ -47,9 +49,17 @@ export function hasTemplate(s: string): boolean {
   return /\{\{[\s\S]*?\}\}/.test(s);
 }
 
-/** Escape literal text for inclusion inside a backtick template literal. */
+/** Escape literal text for inclusion inside a backtick template literal. Newlines are escaped to
+ *  `\n`/`\r` (valid template-literal escapes, same value at runtime) so the literal stays SINGLE-LINE
+ *  — an inline `<Fragment set:html={`…`} />` would otherwise be re-indented by `shift` on every emit,
+ *  growing the embedded whitespace each round-trip (reverseTemplate decodes them back). */
 function escapeBacktick(s: string): string {
-  return s.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$\{/g, '\\${');
+  return s
+    .replace(/\\/g, '\\\\')
+    .replace(/`/g, '\\`')
+    .replace(/\$\{/g, '\\${')
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n');
 }
 
 /** A bare identifier/member dot-chain (`cms.title.pl`) — the only shape `maybeWrapI18n` wraps. */
@@ -72,7 +82,7 @@ const BARE_CHAIN_RE = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/;
 function maybeWrapI18n(expr: string, ctx?: EmitContext): string {
   if (!ctx || ctx.i18nRoots.size === 0) return expr;
   if (!BARE_CHAIN_RE.test(expr)) return expr;
-  const root = expr.split('.', 1)[0];
+  const root = expr.split('.', 1)[0] ?? '';
   if (!ctx.i18nRoots.has(root)) return expr;
   needRuntime(ctx, 'i18n');
   return `i18n(${expr})`;
@@ -110,6 +120,50 @@ function wrapTemplateExpr(inner: string, ctx?: EmitContext): string {
 }
 
 /**
+ * meno-core's runtime resolver reads a numeric array-index path segment via DOT notation
+ * (`categories.0.categoryName` → walk `categories` → `[0]` → `categoryName`, splitting on `.`).
+ * JS — and jsep, so `isSupportedTemplateExpression` — reject `.0`: it scans as a float literal,
+ * so emitting the dot form verbatim inside `{ … }` is an Astro compile error ("Expected '}' but
+ * found '.0'"). Rewrite each member-access dot-number to bracket notation so the expression is
+ * valid JS AND a jsep-parseable binding (the parser reads it back as `{{…[0]…}}` — a one-way
+ * canonicalization; the bracket form is round-trip stable thereafter). Only a `.` that FOLLOWS
+ * an identifier char / `]` / `)` and precedes a pure-digit segment is rewritten — decimal
+ * literals (`price * 1.5`, `.5`) and string contents are left untouched.
+ */
+function numericDotToBracket(expr: string): string {
+  if (!expr.includes('.')) return expr;
+  let out = '';
+  for (let i = 0; i < expr.length; ) {
+    const c = expr[i]!;
+    // Copy string/template literals verbatim so an embedded `foo.0` inside quotes is never touched.
+    if (c === '"' || c === "'" || c === '`') {
+      const start = i++;
+      while (i < expr.length && expr[i] !== c) {
+        if (expr[i] === '\\') i++;
+        i++;
+      }
+      out += expr.slice(start, Math.min(i + 1, expr.length));
+      i++;
+      continue;
+    }
+    const prev = out[out.length - 1] ?? '';
+    if (c === '.' && /[A-Za-z_$\])]/.test(prev)) {
+      let j = i + 1;
+      while (j < expr.length && expr[j]! >= '0' && expr[j]! <= '9') j++;
+      // A complete numeric segment (≥1 digit) not glued to an identifier (`.0a` is not an index).
+      if (j > i + 1 && !(j < expr.length && /[A-Za-z_$]/.test(expr[j]!))) {
+        out += `[${expr.slice(i + 1, j)}]`;
+        i = j;
+        continue;
+      }
+    }
+    out += c;
+    i++;
+  }
+  return out;
+}
+
+/**
  * Convert a Meno template string to the JS expression that goes inside `{ … }`.
  * - `"{{ expr }}"` (whole string) → `expr`
  * - `"Hi {{name}}!"`              → `` `Hi ${name}!` ``
@@ -123,19 +177,20 @@ function wrapTemplateExpr(inner: string, ctx?: EmitContext): string {
 export function templateToExpr(s: string, ctx?: EmitContext): string {
   const matches = [...s.matchAll(TEMPLATE_RE)];
   // Exactly one template spanning the entire string → bare expression.
-  if (matches.length === 1 && matches[0].index === 0 && matches[0][0].length === s.length) {
-    return wrapTemplateExpr(matches[0][1].trim(), ctx);
+  const only = matches[0];
+  if (matches.length === 1 && only !== undefined && only.index === 0 && only[0].length === s.length) {
+    return wrapTemplateExpr(numericDotToBracket((only[1] ?? '').trim()), ctx);
   }
   // Otherwise build a backtick template literal.
   let out = '';
   let last = 0;
   for (const m of matches) {
     out += escapeBacktick(s.slice(last, m.index!));
-    out += '${' + wrapTemplateExpr(m[1].trim(), ctx) + '}';
+    out += `\${${wrapTemplateExpr(numericDotToBracket((m[1] ?? '').trim()), ctx)}}`;
     last = m.index! + m[0].length;
   }
   out += escapeBacktick(s.slice(last));
-  return '`' + out + '`';
+  return `\`${out}\``;
 }
 
 /**
@@ -220,6 +275,11 @@ const NON_BINDING_ROOTS = new Set([
   'null',
   'undefined',
   'this',
+  // meno-core's editor-mode global: the emitter injects it as `const isEditorMode = false;`
+  // wherever the body references it (referencesIsEditorMode). Treating `{{isEditorMode}}` as
+  // an item binding too would ALSO emit `const { isEditorMode } = Astro.props;` — two
+  // declarations of the same const → esbuild "isEditorMode has already been declared".
+  'isEditorMode',
 ]);
 
 /**
@@ -237,7 +297,7 @@ export function collectItemBindings(root: unknown, declaredProps: Iterable<strin
     if (node == null) return;
     if (typeof node === 'string') {
       for (const m of node.matchAll(TEMPLATE_RE)) {
-        const r = rootOf(m[1]);
+        const r = rootOf(m[1] ?? '');
         if (r && !bound.has(r) && !NON_BINDING_ROOTS.has(r)) free.add(r);
       }
       return;
@@ -253,7 +313,8 @@ export function collectItemBindings(root: unknown, declaredProps: Iterable<strin
     let childBound = bound;
     if (obj.type === 'list') {
       const itemVar =
-        (obj.itemAs as string) ?? (obj.sourceType === 'collection' ? singularize(obj.source as string) : 'item');
+        (obj.itemAs as string) ??
+        (obj.sourceType === 'collection' && obj.source ? singularize(obj.source as string) : 'item');
       // Bind the loop var + all loop metadata (generic and itemAs-named) so they are not
       // mistaken for parent-passed item bindings: they resolve to native `.map` expressions
       // inside the list (see rewriteItemRefs), never to `Astro.props`.
@@ -278,21 +339,33 @@ export function collectItemBindings(root: unknown, declaredProps: Iterable<strin
 }
 
 function isI18nValue(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && (v as any)._i18n === true;
+  return typeof v === 'object' && v !== null && (v as Record<string, unknown>)._i18n === true;
 }
 
 /** A verbatim-code marker: arbitrary JS the model preserves rather than coercing. */
 function isCodeMarker(v: unknown): v is { _code: true; expr: string } {
-  return typeof v === 'object' && v !== null && (v as any)._code === true && typeof (v as any).expr === 'string';
+  return (
+    typeof v === 'object' &&
+    v !== null &&
+    (v as Record<string, unknown>)._code === true &&
+    typeof (v as Record<string, unknown>).expr === 'string'
+  );
 }
 
 /**
- * Source for a verbatim JS expression placed inside `{ … }`. Single-line goes inline;
- * multi-line is hoisted to a frontmatter `const __codeN = …;` (column 0, never re-indented
- * by the placer) and referenced by name — mirroring the multi-line embed-HTML hoist.
+ * Source for a verbatim JS expression placed inside `{ … }`. Single-line goes inline; multi-line
+ * is hoisted to a frontmatter `const __codeN = …;` (column 0, never re-indented by the placer) and
+ * referenced by name — mirroring the multi-line embed-HTML hoist.
+ *
+ * EXCEPT a multi-line expression that contains JSX (`items.map(x => <li/>)`) is NEVER hoisted: the
+ * frontmatter is TypeScript, where `<li>` is a type cast (not an element), so esbuild rejects it
+ * ("Expected '>' but found 'class'"). A markup expression may span lines, so such code stays inline
+ * in the body where JSX is valid. The JSX test is deliberately liberal — a false positive only
+ * keeps the expression inline, which is always valid; a missed hoist would break the build.
  */
 function codeExpr(expr: string, ctx: EmitContext): string {
-  if (expr.includes('\n')) {
+  const hasJsx = /<[A-Za-z]/.test(expr) || expr.includes('</');
+  if (expr.includes('\n') && !hasJsx) {
     const name = `__code${ctx.hoistCounter++}`;
     ctx.frontmatterConsts.push(`const ${name} = ${expr};`);
     return name;
@@ -319,12 +392,17 @@ function emitAttr(name: string, value: unknown, ctx: EmitContext, dropEmptyTempl
     return `${name}={i18n(${serializeLiteral(value, { indent: INDENT, width: ctx.width })})}`;
   }
   if (typeof value === 'string') {
+    // A legacy-JSON value passed to a (rich-text) prop may carry meno-core's raw-HTML
+    // sentinel; the receiving prop renders it via `set:html` (richTextProps), so the marker
+    // would only ship as a stray HTML comment. Shed it before serializing — the rich-text
+    // detection below still fires on the underlying markup. See `../richtext`.
+    const str = stripRawHtmlPrefix(value);
     // Rich-text HTML value (a custom span, <strong>, <a>, …) → a backtick template literal
     // so the markup reads cleanly with no `\"` escaping (vs JSON.stringify). The editor-only
     // data-meno-span is stripped (re-added on parse); any nested {{template}} becomes ${…}.
-    if (isRichTextHtml(value)) return `${name}={${templateToExpr(stripMenoSpanMarker(value), ctx)}}`;
-    if (hasTemplate(value)) {
-      const expr = templateToExpr(value, ctx);
+    if (isRichTextHtml(str)) return `${name}={${templateToExpr(stripMenoSpanMarker(str), ctx)}}`;
+    if (hasTemplate(str)) {
+      const expr = templateToExpr(str, ctx);
       // Parity with meno-core's skipEmptyTemplateAttributes: a NODE attribute that is entirely
       // a single `{{template}}` and resolves to "" must be DROPPED — Astro renders empty
       // strings (`fade=""`), meno-core omits them. A `… || undefined` guard makes Astro omit
@@ -333,13 +411,30 @@ function emitAttr(name: string, value: unknown, ctx: EmitContext, dropEmptyTempl
       // reverses the guard back to `{{…}}` (interpretExprValue).
       // A dead-`cms` guard (guardUnscopedCms) already resolves to "" when absent and carries
       // its own reversal; skip the `|| undefined` wrap so the two don't entangle on parse.
-      if (dropEmptyTemplate && expr[0] !== '`' && /^\{\{.+\}\}$/.test(value) && !expr.startsWith('typeof cms ===')) {
+      // A nullish-coalescing expr (`a?.b ?? ''`) ALSO already supplies a default, and
+      // `X ?? Y || undefined` is a hard JS SyntaxError (unparenthesized `??`/`||` mix) — so skip
+      // the guard there too. (`isSupportedTemplateExpression` accepts `?.`/`??` as a binding even
+      // though the wrap can't apply; the expr renders natively at build.)
+      // A loop INDEX binding (`{{tabIndex}}` → `tabIndex`, where `tab` is an active loop var) is
+      // a NUMBER and never the empty string, so meno-core keeps it (`data-x="0"`). The guard
+      // would drop index 0 (`0 || undefined` → undefined), which desyncs scripts that select
+      // panels via `querySelectorAll('[data-x]')` (the tabbed-hero "two tabs" bug). Emit the bare
+      // expr so the 0th item keeps its attribute. (Index vars are `${itemVar}Index`; renderList.)
+      const isLoopIndex = ctx.loopVars.some((v) => expr === `${v}Index`);
+      if (
+        dropEmptyTemplate &&
+        expr[0] !== '`' &&
+        /^\{\{.+\}\}$/.test(str) &&
+        !isLoopIndex &&
+        !expr.startsWith('typeof cms ===') &&
+        !expr.includes('??')
+      ) {
         return `${name}={${expr} || undefined}`;
       }
       return `${name}={${expr}}`;
     }
-    if (!value.includes('"') && !value.includes('\n')) return `${name}="${value}"`;
-    return `${name}={${JSON.stringify(value)}}`;
+    if (!str.includes('"') && !str.includes('\n')) return `${name}="${str}"`;
+    return `${name}={${JSON.stringify(str)}}`;
   }
   if (typeof value === 'number' || typeof value === 'boolean') {
     return `${name}={${value}}`;
@@ -387,25 +482,157 @@ function serializeExprLiteral(value: unknown): string {
   return 'null';
 }
 
+/** Color CSS prop → its class root, for keeping the `var()` shorthand in variant tables. */
+const VARIANT_COLOR_ROOT: Record<string, string> = {
+  color: 'text',
+  backgroundColor: 'bg',
+  borderColor: 'border',
+  accentColor: 'accent',
+  outlineColor: 'outline',
+};
+
+/** The utility class for a CSS prop+value at a breakpoint (engine form), or undefined. */
+function variantClassFor(cssProp: string, value: string | number, bp: string): string | undefined {
+  if (value === '') return undefined;
+  const responsive: ResponsiveStyleObject = { [bp]: { [cssProp]: value } };
+  const cls = responsiveStylesToClasses(responsive)[0];
+  if (!cls) return cls;
+  // A `var(--token)` color value emits the bare token form (`text-muted`) in the static engine, but
+  // variant TABLES keep the self-describing `var()` shorthand (`text-(--muted)`) so they round-trip
+  // through `decodeVariantClass` without the project token set (the table is parsed/built standalone).
+  const root = VARIANT_COLOR_ROOT[cssProp];
+  const varMatch = typeof value === 'string' ? value.match(/^var\((--[\w-]+)\)$/) : null;
+  if (root && varMatch?.[1]) {
+    const bare = `${root}-${varMatch[1].slice(2)}`;
+    if (cls.endsWith(bare)) return `${cls.slice(0, -bare.length)}${root}-(${varMatch[1]})`;
+  }
+  return cls;
+}
+
 /**
- * Build the `class={style(styleLit[, metaLit])}` attribute for a node, or null when
- * the node carries no style/interactive/label metadata.
+ * Whether a prop `_mapping` round-trips LOSSLESSLY through the utility-class form — i.e. every value
+ * either is empty ("no style for this option") or its generated class decodes back (via
+ * `decodeVariantClass`) to the SAME property/value at the SAME breakpoint. The decode re-wraps color
+ * var-token shorthands (`text-(--x)` → `var(--x)`), so color-token values DO round-trip and convert.
+ * Values whose class can't be recovered exactly — e.g. a quoted/comma font stack, or a registry-less
+ * hash class — fail the check and keep the whole mapping on the `style()` path. This is the safety
+ * gate that keeps prop-variant class storage exact.
  */
-function emitClassAttr(node: Node, ctx: EmitContext, extraMeta?: Record<string, unknown>): string | null {
+function mappingConvertibleToClasses(
+  cssProp: string,
+  mapping: { values: Record<string, string | number> },
+  bp: string,
+): boolean {
+  for (const v of Object.values(mapping.values)) {
+    if (v === '') continue;
+    const cls = variantClassFor(cssProp, v, bp);
+    if (!cls) return false;
+    const decoded = decodeVariantClass(cls);
+    const decodedBp = splitVariantPrefix(cls).breakpoint || 'base';
+    if (!decoded || decoded.prop !== cssProp || String(decoded.value) !== String(v) || decodedBp !== bp) return false;
+  }
+  return true;
+}
+
+/**
+ * Split a style value into its non-variant part and a prop-driven VARIANT TABLE
+ * (`{ propName: { propValue: "utility classes" } }`) — the class form of prop `_mapping`s. Only
+ * mappings that round-trip losslessly (`mappingConvertibleToClasses`) are extracted; any other
+ * `_mapping` (e.g. color tokens) is left in `withoutMappings` on the `style()` path. Empty
+ * breakpoint buckets are preserved. Returns null when nothing was extracted.
+ */
+function extractVariantTable(
+  style: unknown,
+): { withoutMappings: unknown; table: Record<string, Record<string, string>> } | null {
+  if (!style || typeof style !== 'object') return null;
+  const s = style as Record<string, unknown>;
+  const responsive = 'base' in s || 'tablet' in s || 'mobile' in s;
+  const buckets: Array<[string, Record<string, unknown>]> = responsive
+    ? Object.entries(s)
+        .filter(([, v]) => v && typeof v === 'object')
+        .map(([bp, v]) => [bp, v as Record<string, unknown>])
+    : [['base', s as Record<string, unknown>]];
+
+  const table: Record<string, Record<string, string>> = {};
+  const without: Record<string, Record<string, unknown>> = {};
+  let extracted = false;
+
+  for (const [bp, bucket] of buckets) {
+    for (const [cssProp, val] of Object.entries(bucket)) {
+      const isMapping = val && typeof val === 'object' && (val as { _mapping?: unknown })._mapping === true;
+      if (isMapping && mappingConvertibleToClasses(cssProp, val as { values: Record<string, string | number> }, bp)) {
+        extracted = true;
+        const m = val as { prop: string; values: Record<string, string | number> };
+        const lookup: Record<string, string> = table[m.prop] ?? {};
+        table[m.prop] = lookup;
+        for (const [key, cssVal] of Object.entries(m.values)) {
+          const k = String(key);
+          const cls = variantClassFor(cssProp, cssVal, bp);
+          // An empty option ("no style") is recorded as an empty entry so it survives round-trip.
+          if (cls) lookup[k] = lookup[k] ? `${lookup[k]} ${cls}` : cls;
+          else if (!(k in lookup)) lookup[k] = '';
+        }
+      } else {
+        if (!without[bp]) without[bp] = {};
+        without[bp][cssProp] = val;
+      }
+    }
+  }
+  if (!extracted) return null;
+
+  let withoutMappings: unknown;
+  if (responsive) {
+    const out: Record<string, unknown> = {};
+    for (const bp of Object.keys(s)) if (s[bp] && typeof s[bp] === 'object') out[bp] = without[bp] ?? {};
+    withoutMappings = out;
+  } else {
+    withoutMappings = without.base ?? {};
+  }
+  return { withoutMappings, table };
+}
+
+/**
+ * Build the `class={…}` attribute for a node, or null when it carries no style/interactive/label
+ * metadata. Static styling emits `class={style(…)}`; a node with losslessly-convertible prop
+ * `_mapping`s emits the class form `class={cx(style(static…), variants(props, table))}` (or just
+ * `class={variants(props, table)}` when nothing static remains) — table values are utility classes.
+ */
+/**
+ * The cx-able styling fragments for a node's OWN style — the `style(…)` / `variants(…)` calls,
+ * minus any `class={…}` wrapper, instance seam, or static-class merge. Shared by the plain
+ * `emitClassAttr` (non-root) and the structure-root `cx(…)` form (classAttrFor). `extraMeta`
+ * carries caller markers (`instance` / `root`) that fold into the `style()` meta argument.
+ * Returns `[]` when the node has no style and no meta (no class attr at all).
+ */
+function classFragments(node: Node, ctx: EmitContext, extraMeta: Record<string, unknown>): string[] {
   const meta: Record<string, unknown> = { ...extraMeta };
-  // The component structure's root carries `root: true` so the runtime style() merges
-  // the instance class the parent passed (`__props.class`) over the root's own classes
-  // (meno-core's instance-over-root merge). Emitted even when the root has no style of
-  // its own — the incoming instance class must still land on the element. The marker is
-  // emit-only (the parser drops it, like `instance`/`kind`) and re-derived every emit.
-  if (ctx.structureRoot !== undefined && node === ctx.structureRoot) meta.root = true;
   if (node.interactiveStyles !== undefined) meta.interactive = node.interactiveStyles;
   if (node.label !== undefined) meta.label = node.label;
   if (node.generateElementClass !== undefined) meta.genClass = node.generateElementClass;
 
   const hasStyle = hasStyleContent(node.style);
   const hasMeta = Object.keys(meta).length > 0;
-  if (!hasStyle && !hasMeta) return null;
+  if (!hasStyle && !hasMeta) return [];
+
+  // Losslessly-convertible prop `_mapping`s → the class form `variants(props, table)`, combined with
+  // any remaining static styling / meta via `cx(style(…), variants(…))`. Lossy mappings (color
+  // tokens) fall through to the plain `style(…)` fragment unchanged.
+  const variantInfo = extractVariantTable(node.style);
+  if (variantInfo) {
+    needRuntime(ctx, 'variants');
+    const vp = ctx.propsVar ?? 'undefined';
+    const tableLit = serializeLiteral(variantInfo.table, { indent: INDENT, width: ctx.width });
+    const variantCall = `variants(${vp}, ${tableLit})`;
+    if (!hasStyleContent(variantInfo.withoutMappings) && !hasMeta) return [variantCall];
+    needRuntime(ctx, 'style');
+    const lit = serializeLiteral(variantInfo.withoutMappings ?? {}, { indent: INDENT, width: ctx.width });
+    const styleCall = hasMeta
+      ? `style(${lit}, ${vp}, ${serializeLiteral(meta, { indent: INDENT, width: ctx.width })})`
+      : ctx.propsVar
+        ? `style(${lit}, ${ctx.propsVar})`
+        : `style(${lit})`;
+    return [styleCall, variantCall];
+  }
 
   needRuntime(ctx, 'style');
   const styleLit = serializeLiteral(node.style ?? {}, { indent: INDENT, width: ctx.width });
@@ -413,14 +640,74 @@ function emitClassAttr(node: Node, ctx: EmitContext, extraMeta?: Record<string, 
   // `__props`; a page has none). The parser skips the props arg and reads meta from the
   // object-literal arg, so both `style(obj, props, meta)` and `style(obj)` round-trip.
   const propsArg = ctx.propsVar;
-  if (!hasMeta) return propsArg ? `class={style(${styleLit}, ${propsArg})}` : `class={style(${styleLit})}`;
+  if (!hasMeta) return [propsArg ? `style(${styleLit}, ${propsArg})` : `style(${styleLit})`];
   const metaLit = serializeLiteral(meta, { indent: INDENT, width: ctx.width });
-  return `class={style(${styleLit}, ${propsArg ?? 'undefined'}, ${metaLit})}`;
+  return [`style(${styleLit}, ${propsArg ?? 'undefined'}, ${metaLit})`];
+}
+
+/**
+ * Build the `class={…}` attribute for a node, or null when it carries no style/interactive/label
+ * metadata. Static styling emits `class={style(…)}`; a node with losslessly-convertible prop
+ * `_mapping`s emits the class form `class={cx(style(…), variants(…))}` (or just
+ * `class={variants(…)}` when nothing static remains) — table values are utility classes.
+ *
+ * The COMPONENT STRUCTURE ROOT does NOT come through here — it uses the `cx(…, className)`
+ * instance-merge form (see classAttrFor). A component-INSTANCE that is itself a structure root
+ * (rare: a component whose root is another component) still flows through renderComponentInstance
+ * → here, and keeps the legacy `style(…, { root: true })` merge (the marker is emit-only, dropped
+ * on parse, re-derived every emit).
+ */
+function emitClassAttr(node: Node, ctx: EmitContext, extraMeta?: Record<string, unknown>): string | null {
+  const meta: Record<string, unknown> = { ...extraMeta };
+  if (ctx.structureRoot !== undefined && node === ctx.structureRoot) meta.root = true;
+  const frags = classFragments(node, ctx, meta);
+  if (frags.length === 0) return null;
+  if (frags.length === 1) return `class={${frags[0]}}`;
+  needRuntime(ctx, 'cx');
+  return `class={cx(${frags.join(', ')})}`;
+}
+
+/**
+ * The class attribute for an element-like node, folding in any static `attributes.class`.
+ *
+ * Non-root nodes keep the historical form (`class={style(…)}`, or `class={style(…) + " static"}`
+ * when a foreign static class rides along). The COMPONENT STRUCTURE ROOT instead collapses to the
+ * conflict-aware `cx(…)` instance-merge form (spec §8/§9, runtime `cx`):
+ *   `class={cx(<own styling…>, "<static>"?, className)}`
+ * so the instance class the parent passed (destructured `class: className` in every component)
+ * merges over the root's own classes per (breakpoint, CSS property) — the class-level equivalent
+ * of meno-core's instance-over-root style merge. `cx` owns the merge, so the root's own fragments
+ * carry NO `root: true` meta. Emitted even for a style-less, static-less root (`cx(className)`) —
+ * the incoming instance class must still land on the element.
+ *
+ * Returns the attribute string (or null when a non-root carries no own styling) plus whether the
+ * static class was consumed here (so emitAttributes skips re-emitting it as a duplicate `class`).
+ */
+function classAttrFor(
+  node: Node,
+  ctx: EmitContext,
+  staticSource: unknown,
+): { attr: string | null; skipStatic: boolean } {
+  if (ctx.structureRoot !== undefined && node === ctx.structureRoot) {
+    const frags = classFragments(node, ctx, {});
+    const stat = staticClassOf(staticSource);
+    const parts = [...frags];
+    if (stat !== undefined) parts.push(JSON.stringify(stat));
+    // The destructured instance class (`const { …, class: className } = __props`, always bound —
+    // see buildPropsBlock). cx drops a falsy arg, so an instance with no override is a no-op.
+    parts.push('className');
+    needRuntime(ctx, 'cx');
+    return { attr: `class={cx(${parts.join(', ')})}`, skipStatic: stat !== undefined };
+  }
+  const cls = emitClassAttr(node, ctx);
+  if (!cls) return { attr: null, skipStatic: false };
+  const stat = staticClassOf(staticSource);
+  return { attr: stat !== undefined ? mergeStaticClass(cls, stat) : cls, skipStatic: stat !== undefined };
 }
 
 /** CSS property name (kebab-case) for a model style key. Idempotent for already-kebab keys. */
 function cssPropName(key: string): string {
-  return key.replace(/[A-Z]/g, (m) => '-' + m.toLowerCase());
+  return key.replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`);
 }
 
 /**
@@ -481,7 +768,7 @@ function emitInlineStyleAttr(node: Node, ctx: EmitContext): string | null {
   const props = templatedStyleProps(node.style, isRoot);
   if (props.length === 0) return null;
   // `{{expr}}` → `${expr}` inside a template literal; surrounding text stays literal.
-  const resolve = (val: string) => val.replace(TEMPLATE_RE, (_m, e) => '${' + String(e).trim() + '}');
+  const resolve = (val: string) => val.replace(TEMPLATE_RE, (_m, e) => `\${${String(e).trim()}}`);
   if (isRoot && ctx.propsVar !== undefined) {
     needRuntime(ctx, 'inlineStyle');
     const entries = props.map(([name, val]) => `${JSON.stringify(name)}: \`${resolve(val)}\``);
@@ -529,7 +816,7 @@ function staticClassOf(value: unknown): string | undefined {
  * `attributes.class` (staticClassSuffix).
  */
 function mergeStaticClass(cls: string, staticClass: string): string {
-  return `${cls.slice(0, -1)} + ${JSON.stringify(' ' + staticClass)}}`;
+  return `${cls.slice(0, -1)} + ${JSON.stringify(` ${staticClass}`)}}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -574,7 +861,14 @@ const LOCALE_KNOWN_KEYS = new Set([
 /** If `s` is exactly one `{{ identifier }}` template, return the identifier; else null. */
 function bareTemplateIdent(s: string): string | null {
   const m = s.match(/^\{\{\s*([A-Za-z_$][\w$]*)\s*\}\}$/);
-  return m ? m[1] : null;
+  return m ? (m[1] ?? null) : null;
+}
+
+/** If `s` is exactly one `{{ root.field }}` template (a two-part member ref, e.g. `tab.title`),
+ *  return `{root, field, chain}`; else null. Used to spot a rich-text loop-item field binding. */
+function memberTemplate(s: string): { root: string; field: string; chain: string } | null {
+  const m = s.match(/^\{\{\s*([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\s*\}\}$/);
+  return m ? { root: m[1] ?? '', field: m[2] ?? '', chain: `${m[1]}.${m[2]}` } : null;
 }
 
 /** If `s` is exactly one `{{ cms.<field>… }}` template whose top-level field is a CMS rich-text
@@ -582,7 +876,7 @@ function bareTemplateIdent(s: string): string | null {
 function cmsRichTextChain(s: string, ctx: EmitContext): string | null {
   if (!ctx.cmsRichTextFields?.size) return null;
   const m = s.match(/^\{\{\s*(cms\.([A-Za-z_$][\w$]*)(?:\.[A-Za-z_$][\w$]*)*)\s*\}\}$/);
-  return m && ctx.cmsRichTextFields.has(m[2]) ? m[1] : null;
+  return m && ctx.cmsRichTextFields.has(m[2] ?? '') ? (m[1] ?? null) : null;
 }
 
 /**
@@ -598,8 +892,28 @@ function cmsRichTextChain(s: string, ctx: EmitContext): string | null {
  * text nodes stay distinct on parse (`forceExpr`). Every form parses back to the same node.
  */
 function emitTextChild(text: string, ctx: EmitContext, forceExpr = false): string {
+  // A legacy-JSON raw-HTML child (`<!--MENO_RAW_HTML-->{{tab.title}}` or `…literal<br>…`)
+  // must render as REAL HTML: strip the meno-core sentinel and route the payload — which may
+  // be a bare binding with no detectable tag — through `<Fragment set:html>`. Without this the
+  // marker + markup ship as escaped text (a hero heading shows `<!--MENO_RAW_HTML-->Raise
+  // more.<br>…` literally). See `../richtext`.
+  if (hasRawHtmlPrefix(text)) {
+    return `<Fragment set:html={${templateToExpr(stripMenoSpanMarker(stripRawHtmlPrefix(text)), ctx)}} />`;
+  }
   const ident = bareTemplateIdent(text);
-  if (ident && ctx.richTextProps?.has(ident)) return `<Fragment set:html={${ident}} />`;
+  if (ident && ctx.richTextProps?.has(ident)) {
+    // A `type:"rich-text"` prop can carry embedded project components — a CMS rich-text field
+    // forwarded into this component's prop (`<RichBlock body={cms.content} />`) where the field
+    // contains a `menoComponent` node. Render the prop through the SAME registry-backed pass the
+    // CMS text-child path uses (`richTextWithComponents(<prop>, cmsComponents)`) so those
+    // components render instead of leaking as empty `<div data-meno-component>` markers.
+    // resolveProps already normalized the prop to an HTML string (URL embeds expanded, generic
+    // component markers preserved) and richTextWithComponents is idempotent on strings, so this
+    // composes. The parser reverses `richTextWithComponents(<ident>, cmsComponents)` → `{{ident}}`
+    // (parseValue), which re-emits here because `ident` is a rich-text prop, so it round-trips.
+    ctx.needsCmsComponents = true;
+    return `<Fragment set:html={${needRuntime(ctx, 'richTextWithComponents')}(${ident}, cmsComponents)} />`;
+  }
   // A CMS rich-text field bound as a text child (`{{cms.content}}`) renders its raw TipTap
   // value as HTML via the runtime `richTextWithComponents()` — a CMS page has no resolveProps,
   // so a plain `{i18n(cms.content)}` would string-coerce the object to "[object Object]", and
@@ -611,12 +925,35 @@ function emitTextChild(text: string, ctx: EmitContext, forceExpr = false): strin
     ctx.needsCmsComponents = true;
     return `<Fragment set:html={${needRuntime(ctx, 'richTextWithComponents')}(${cmsRt}, cmsComponents)} />`;
   }
+  // A rich-text field of a list loop item bound as a text child (`{{tab.title}}` where the
+  // list's itemSchema declares `title` as rich-text). The list-item analog of the rich-text
+  // PROP branch above: render as REAL HTML via richTextWithComponents (embedded components
+  // resolve; inline marks/spans survive) instead of shipping ESCAPED as `{tab.title}` — the
+  // literal `<br>`/`<span>`/`<div>` hero-heading bug. renderList registered the loop var's
+  // rich-text field names in richTextLoopFields. Round-trips: the parser reverses
+  // richTextWithComponents(<chain>, cmsComponents) → `{{chain}}`, re-emitted here next pass.
+  const member = memberTemplate(text);
+  if (member && ctx.richTextLoopFields?.some((f) => f.itemVar === member.root && f.fields.has(member.field))) {
+    ctx.needsCmsComponents = true;
+    return `<Fragment set:html={${needRuntime(ctx, 'richTextWithComponents')}(${member.chain}, cmsComponents)} />`;
+  }
   // Direct rich-text content (checked before the generic template branch so HTML carrying a
   // {{template}} still renders as markup): strip the editor-only marker, turn {{…}} into ${…}.
   if (isRichTextHtml(text)) return `<Fragment set:html={${templateToExpr(stripMenoSpanMarker(text), ctx)}} />`;
   if (hasTemplate(text)) return `{${templateToExpr(text, ctx)}}`;
-  const safeRaw = !forceExpr && text.length > 0 && text === text.trim() && !/[{}<>]/.test(text);
-  return safeRaw ? text : `{${JSON.stringify(text)}}`;
+  // Multi-line text (contains a newline) is NOT raw-safe: as bare markup its continuation lines get
+  // re-indented by `shift` every emit, growing the embedded whitespace each round-trip. The escaped
+  // `{JSON.stringify(text)}` form keeps it single-line (and exact); parse reads the string back.
+  const safeRaw = !forceExpr && text.length > 0 && text === text.trim() && !/[{}<>\n\r]/.test(text);
+  if (safeRaw) return text;
+  const literal = JSON.stringify(text);
+  // Astro-compiler workaround: a text-expression string literal ENDING in a newline escape
+  // (`{"…\n"}`), when the next sibling is an element with element children, miscompiles — the
+  // compiler closes the render template early and emits a dangling `$$render\``, surfacing as
+  // `Expected "}"`. Padding the braces (`{ "…\n" }`) so the literal doesn't abut `}` dodges it;
+  // the parser trims the expression inner, so the text round-trips unchanged. (Webflow paragraph
+  // /excerpt text carries trailing newlines, which is where this bites.)
+  return /[\n\r]$/.test(text) ? `{ ${literal} }` : `{${literal}}`;
 }
 
 /** Render a children value (string | array) to an array of column-0 child blocks. */
@@ -637,12 +974,13 @@ function emitChildrenList(children: unknown, ctx: EmitContext): string[] {
  * at column 0. Inlines a single one-line child for compactness.
  */
 function composeElement(tag: string, attrs: string[], childBlocks: string[], forceVoid = false): string {
-  const attrStr = attrs.length ? ' ' + attrs.join(' ') : '';
+  const attrStr = attrs.length ? ` ${attrs.join(' ')}` : '';
   if (forceVoid || childBlocks.length === 0) {
     return `<${tag}${attrStr} />`;
   }
-  if (childBlocks.length === 1 && !childBlocks[0].includes('\n')) {
-    return `<${tag}${attrStr}>${childBlocks[0]}</${tag}>`;
+  const onlyChild = childBlocks[0];
+  if (childBlocks.length === 1 && onlyChild !== undefined && !onlyChild.includes('\n')) {
+    return `<${tag}${attrStr}>${onlyChild}</${tag}>`;
   }
   const inner = childBlocks.map((c) => shift(c, INDENT)).join('\n');
   return `<${tag}${attrStr}>\n${inner}\n</${tag}>`;
@@ -652,7 +990,24 @@ function composeElement(tag: string, attrs: string[], childBlocks: string[], for
 // Per-node renderers (build at column 0)
 // ---------------------------------------------------------------------------
 
+/**
+ * Marker attribute opting an `<img>` into Astro `astro:assets` optimization. Set by the
+ * editor; consumed here (emitted as `<MenoImage>` instead of `<img>`) and re-added on parse,
+ * so it round-trips without ever appearing as a literal attribute in the output.
+ */
+export const OPTIMIZE_ATTR = 'data-meno-optimize';
+
+function isOptimizedImg(node: Node): boolean {
+  return (
+    String(node.tag).toLowerCase() === 'img' &&
+    (node.attributes as Record<string, unknown> | undefined)?.[OPTIMIZE_ATTR] === 'true'
+  );
+}
+
 function renderHtml(node: Node, ctx: EmitContext): Rendered {
+  // An `<img data-meno-optimize="true">` emits as the runtime `<MenoImage>` wrapper, which
+  // renders Astro's optimizing `<Image>` (astro:assets). See renderMenoImage.
+  if (isOptimizedImg(node)) return renderMenoImage(node, ctx);
   let tag = node.tag as string;
   // Dynamic tag (e.g. "h{{size}}") → a frontmatter const referenced as <Tag_N>.
   if (typeof tag === 'string' && hasTemplate(tag)) {
@@ -667,13 +1022,14 @@ function renderHtml(node: Node, ctx: EmitContext): Rendered {
     // Lowercase it so it emits as — and round-trips back to — a literal element.
     tag = tag.toLowerCase();
   }
-  const cls = emitClassAttr(node, ctx);
-  const stat = cls ? staticClassOf((node.attributes as Record<string, unknown> | undefined)?.class) : undefined;
-  const attrs = [
-    stat !== undefined ? mergeStaticClass(cls as string, stat) : cls,
-    emitInlineStyleAttr(node, ctx),
-    ...emitAttributes(node, ctx, stat !== undefined),
-  ].filter(Boolean) as string[];
+  const { attr: clsAttr, skipStatic } = classAttrFor(
+    node,
+    ctx,
+    (node.attributes as Record<string, unknown> | undefined)?.class,
+  );
+  const attrs = [clsAttr, emitInlineStyleAttr(node, ctx), ...emitAttributes(node, ctx, skipStatic)].filter(
+    Boolean,
+  ) as string[];
   const isVoid = VOID_ELEMENTS.has(String(node.tag).toLowerCase());
   const childBlocks = isVoid ? [] : emitChildrenList(node.children, ctx);
   return { kind: 'element', markup: composeElement(tag, attrs, childBlocks, isVoid) };
@@ -681,11 +1037,21 @@ function renderHtml(node: Node, ctx: EmitContext): Rendered {
 
 /** A tag string with `{{…}}` → an Astro template-literal const value, e.g. `` `h${size}` ``. */
 function tagToTemplateLiteral(tag: string): string {
-  const body = tag.replace(TEMPLATE_RE, (_m, e) => '${' + String(e).trim() + '}');
-  return '`' + body + '`';
+  const body = tag.replace(TEMPLATE_RE, (_m, e) => `\${${String(e).trim()}}`);
+  return `\`${body}\``;
 }
 
 function renderComponentInstance(node: Node, ctx: EmitContext): Rendered {
+  // Dangling reference: an authoritative component registry is in scope (categorized convert /
+  // editor save) and this name isn't in it — its source component was deleted while this body
+  // kept referencing it. Render nothing (a JSX comment, like the unknown-type fallback in
+  // renderNode) WITHOUT registering an import: a hard `import X from './X.astro'` to a file that
+  // was never emitted crashes Astro SSR ("FailedToLoadModuleSSR: Could not import …"). The legacy
+  // renderer rendered a missing component as nothing, so this preserves behavior + round-trips
+  // (re-parse drops the comment; the dangling reference is simply gone). See EmitContext.knownComponents.
+  if (ctx.knownComponents && !ctx.knownComponents.has(node.component)) {
+    return { kind: 'element', markup: `{/* meno:missing-component ${JSON.stringify(node.component)} */}` };
+  }
   const tag = componentIdentFor(ctx, node.component);
   ctx.components.add(node.component);
   const attrs: string[] = [];
@@ -745,25 +1111,100 @@ function renderComponentInstance(node: Node, ctx: EmitContext): Rendered {
   return { kind: 'element', markup: composeElement(tag, attrs, childBlocks) };
 }
 
+/**
+ * Render an island (`type:"island"`) — a BYO framework component placed as
+ * `<Counter client:visible initial={3} />`. Unlike a Meno `component`, an island carries
+ * no `style()` class, no instance-style merge and no cms/loop/ambient forwarding: it's a
+ * framework file, so only its explicit props (and a single `client:*` directive) are
+ * emitted. The import resolves to `src/islands/<src>` (buildImportLines + islandImportPath).
+ */
+function renderIslandInstance(node: Node, ctx: EmitContext): Rendered {
+  const src = typeof node.src === 'string' ? node.src : '';
+  const tag = islandIdentFor(ctx, src);
+  ctx.islands.add(src);
+  const attrs: string[] = [];
+  // A single client:* hydration directive. Omitted entirely = a server-rendered island
+  // (valid Astro, zero JS). `media`/`only` carry a value (media query / framework name);
+  // `load`/`idle`/`visible` are bare.
+  const client = node.client as { directive?: unknown; value?: unknown } | undefined;
+  if (client && typeof client.directive === 'string') {
+    attrs.push(
+      client.value !== undefined && client.value !== ''
+        ? `client:${client.directive}="${String(client.value)}"`
+        : `client:${client.directive}`,
+    );
+  }
+  const props = node.props && typeof node.props === 'object' ? (node.props as Record<string, unknown>) : {};
+  for (const [k, v] of Object.entries(props)) attrs.push(emitAttr(k, v, ctx));
+  const childBlocks = emitChildrenList(node.children, ctx);
+  return { kind: 'element', markup: composeElement(tag, attrs, childBlocks) };
+}
+
+/**
+ * Render a custom-`.astro` node (`type:"custom"`) — a hand-authored Astro component under
+ * `src/custom/` that Meno treats as an OPAQUE black box. Like an island it carries no
+ * `style()` class, no instance-style merge and no cms/loop/ambient forwarding (Meno can't
+ * introspect a foreign file's prop needs, so only what the user explicitly sets is emitted):
+ * just its explicit props and slotted children. Unlike an island it takes no `client:*`
+ * directive — a `.astro` component is server-only by nature. The import resolves to
+ * `src/custom/<src>` (buildImportLines + customAstroImportPath).
+ */
+function renderCustomAstro(node: Node, ctx: EmitContext): Rendered {
+  const src = typeof node.src === 'string' ? node.src : '';
+  const tag = customAstroIdentFor(ctx, src);
+  ctx.customAstro.add(src);
+  const attrs: string[] = [];
+  const props = node.props && typeof node.props === 'object' ? (node.props as Record<string, unknown>) : {};
+  for (const [k, v] of Object.entries(props)) attrs.push(emitAttr(k, v, ctx));
+  const childBlocks = emitChildrenList(node.children, ctx);
+  return { kind: 'element', markup: composeElement(tag, attrs, childBlocks) };
+}
+
 function renderSlot(node: Node, ctx: EmitContext): Rendered {
+  // A named slot (`<slot name="header">`) lets a component expose multiple injection points;
+  // the default (unnamed) slot omits the attribute. `node.default` is the fallback content.
+  const attrs: string[] = [];
+  if (typeof node.name === 'string' && node.name) attrs.push(`name=${JSON.stringify(node.name)}`);
   const def = node.default;
-  if (def === undefined) return { kind: 'element', markup: '<slot />' };
-  const childBlocks = emitChildrenList(def, ctx);
-  return { kind: 'element', markup: composeElement('slot', [], childBlocks) };
+  const childBlocks = def === undefined ? [] : emitChildrenList(def, ctx);
+  return { kind: 'element', markup: composeElement('slot', attrs, childBlocks) };
+}
+
+/**
+ * A static link's `href` must be a string (or a prop-`_mapping`); `target` is a node
+ * attribute. A legacy website import stored external links as a `LinkPropValue` object
+ * (`{ href, target? }`) sitting at the node-`href` position. Emitting that through `href()`
+ * flattens it to the bare URL at build (silently dropping `target`) and the round-tripped
+ * object fails the editor's Link schema (`string | LinkMapping`). Flatten it before emit:
+ * URL → `href`, `target` → attribute. Prop-`_mapping` / i18n hrefs are left untouched.
+ */
+function normalizeLinkHref(node: Node): Node {
+  const h = node.href as Record<string, unknown> | undefined;
+  if (!(h && typeof h === 'object' && !h._mapping && !h._i18n && typeof h.href === 'string')) return node;
+  const attributes: Record<string, unknown> = { ...(node.attributes as Record<string, unknown> | undefined) };
+  if (typeof h.target === 'string' && h.target && attributes.target === undefined) attributes.target = h.target;
+  const next: Node = { ...node, href: h.href };
+  if (Object.keys(attributes).length) next.attributes = attributes;
+  else delete next.attributes;
+  return next;
 }
 
 function renderLink(node: Node, ctx: EmitContext): Rendered {
   needRuntimeComponent(ctx, 'Link');
+  node = normalizeLinkHref(node);
   const attrs: string[] = [emitHref(node.href, ctx)];
   // No reset marker in the source: the `.olink` reset is applied at render by the Link.astro
   // runtime component (linkClass), so it reaches every link without a per-instance marker or a
   // re-convert. A style-less link emits no class attr at all → Link.astro adds the full reset.
-  const cls = emitClassAttr(node, ctx);
-  const stat = cls ? staticClassOf((node.attributes as Record<string, unknown> | undefined)?.class) : undefined;
-  if (cls) attrs.push(stat !== undefined ? mergeStaticClass(cls, stat) : cls);
+  const { attr: clsAttr, skipStatic } = classAttrFor(
+    node,
+    ctx,
+    (node.attributes as Record<string, unknown> | undefined)?.class,
+  );
+  if (clsAttr) attrs.push(clsAttr);
   const inlineStyle = emitInlineStyleAttr(node, ctx);
   if (inlineStyle) attrs.push(inlineStyle);
-  attrs.push(...emitAttributes(node, ctx, stat !== undefined));
+  attrs.push(...emitAttributes(node, ctx, skipStatic));
   const childBlocks = emitChildrenList(node.children, ctx);
   return { kind: 'element', markup: composeElement('Link', attrs.filter(Boolean), childBlocks) };
 }
@@ -808,19 +1249,90 @@ function renderEmbed(node: Node, ctx: EmitContext): Rendered {
     } else {
       attrs.push(`html={${expr}}`);
     }
+    // An Embed bound entirely to a CMS rich-text field (`<Embed html={{cms.content}} />`) can
+    // carry embedded `menoComponent` nodes — pass the component registry so Embed.astro renders
+    // them (richTextWithComponents) instead of leaking empty markers. The `components` attr is
+    // emit-only plumbing: re-derived here from the html binding, and dropped on parse, so it
+    // round-trips. Same detection (cmsRichTextChain) + registry as the text-child path.
+    if (cmsRichTextChain(node.html, ctx)) {
+      ctx.needsCmsComponents = true;
+      attrs.push('components={cmsComponents}');
+    }
   } else {
     needRuntime(ctx, 'embedHtml');
     // Thread props (like style()/href()) so a prop-bound HtmlMapping resolves at render.
     const htmlLit = serializeLiteral(node.html, { indent: INDENT, width: ctx.width });
     attrs.push(ctx.propsVar ? `html={embedHtml(${htmlLit}, ${ctx.propsVar})}` : `html={embedHtml(${htmlLit})}`);
   }
-  const cls = emitClassAttr(node, ctx);
-  const stat = cls ? staticClassOf((node.attributes as Record<string, unknown> | undefined)?.class) : undefined;
-  if (cls) attrs.push(stat !== undefined ? mergeStaticClass(cls, stat) : cls);
+  const { attr: clsAttr, skipStatic } = classAttrFor(
+    node,
+    ctx,
+    (node.attributes as Record<string, unknown> | undefined)?.class,
+  );
+  if (clsAttr) attrs.push(clsAttr);
   const inlineStyle = emitInlineStyleAttr(node, ctx);
   if (inlineStyle) attrs.push(inlineStyle);
-  attrs.push(...emitAttributes(node, ctx, stat !== undefined));
+  attrs.push(...emitAttributes(node, ctx, skipStatic));
   return { kind: 'element', markup: composeElement('Embed', attrs, [], true) };
+}
+
+/**
+ * Render an optimized image (`<img data-meno-optimize="true">`) as the runtime `<MenoImage>`
+ * component, which wraps Astro's `astro:assets` `<Image>` (build-time optimization, responsive
+ * output). The model stays a plain `img` node — only the marker attribute distinguishes it —
+ * so non-optimized images keep emitting as bare `<img>`. The marker itself is consumed (NOT
+ * emitted): it is the parse discriminator, re-added on parse. Every other attribute (`src`,
+ * `alt`, `width`, `height`, …) plus class/inline-style passes through the same machinery as
+ * `renderHtml`, so a templated `src` and full style()/interactive-style parity are preserved.
+ */
+function renderMenoImage(node: Node, ctx: EmitContext): Rendered {
+  needRuntimeComponent(ctx, 'MenoImage');
+  // Strip the discriminator marker before emitting attributes (re-added on parse).
+  const attributes = { ...(node.attributes as Record<string, unknown>) };
+  delete attributes[OPTIMIZE_ATTR];
+  const imgNode = { ...node, attributes } as Node;
+  // imgNode is a copy → never `=== ctx.structureRoot`, so classAttrFor takes the non-root
+  // path here (an optimized image is not treated as a structure root, matching prior behavior).
+  const { attr: clsAttr, skipStatic } = classAttrFor(imgNode, ctx, attributes.class);
+  const attrs = [clsAttr, emitInlineStyleAttr(imgNode, ctx), ...emitAttributes(imgNode, ctx, skipStatic)].filter(
+    Boolean,
+  ) as string[];
+  // `<img>` is void → self-closing, no children.
+  return { kind: 'element', markup: composeElement('MenoImage', attrs, [], true) };
+}
+
+/**
+ * Render a markdown node (`type:"markdown"`) as the runtime `<Markdown source={…} />`
+ * component, which renders `set:html={renderMarkdown(source)}` at build. The source is
+ * VERBATIM, whitespace-significant Markdown — never template-resolved (a literal `{{` or
+ * `${` in Markdown must survive) — so it always emits as a backtick string literal
+ * (escapeBacktick), and multi-line source is hoisted to a never-reindented frontmatter const
+ * (`const __mdN = \`…\``) exactly like the embed-node verbatim-HTML path. Class / inline style
+ * / passthrough attributes mirror renderEmbed so a styled markdown block round-trips.
+ */
+function renderMarkdown(node: Node, ctx: EmitContext): Rendered {
+  needRuntimeComponent(ctx, 'Markdown');
+  const attrs: string[] = [];
+  const source = typeof node.source === 'string' ? node.source : '';
+  const expr = `\`${escapeBacktick(source)}\``;
+  if (source.includes('\n')) {
+    // Multi-line Markdown must not be re-indented by the placer — hoist to a frontmatter const.
+    const name = `__md${ctx.hoistCounter++}`;
+    ctx.frontmatterConsts.push(`const ${name} = ${expr};`);
+    attrs.push(`source={${name}}`);
+  } else {
+    attrs.push(`source={${expr}}`);
+  }
+  const { attr: clsAttr, skipStatic } = classAttrFor(
+    node,
+    ctx,
+    (node.attributes as Record<string, unknown> | undefined)?.class,
+  );
+  if (clsAttr) attrs.push(clsAttr);
+  const inlineStyle = emitInlineStyleAttr(node, ctx);
+  if (inlineStyle) attrs.push(inlineStyle);
+  attrs.push(...emitAttributes(node, ctx, skipStatic));
+  return { kind: 'element', markup: composeElement('Markdown', attrs, [], true) };
 }
 
 function renderLocaleList(node: Node, ctx: EmitContext): Rendered {
@@ -879,7 +1391,7 @@ function renderList(node: Node, ctx: EmitContext): Rendered {
   // Compute the loop-item var BEFORE emitting children, and make it visible on the
   // loopVars stack while they emit — so a component instance used as the item
   // template receives the item as a prop (e.g. `<BlogListCard post={post} />`).
-  const itemVar = node.itemAs ?? (sourceType === 'collection' ? singularize(node.source) : 'item');
+  const itemVar = node.itemAs ?? (sourceType === 'collection' && node.source ? singularize(node.source) : 'item');
   const indexVar = `${itemVar}Index`;
 
   // Resolve every loop reference in the item template to native JS off the `.map` args:
@@ -898,9 +1410,18 @@ function renderList(node: Node, ctx: EmitContext): Rendered {
   const isCollection = (node.sourceType ?? 'prop') === 'collection';
   const hadI18nRoot = ctx.i18nRoots.has(itemVar);
   if (isCollection) ctx.i18nRoots.add(itemVar);
+  // Activate this list's rich-text item fields for `itemVar` while its children emit, so a
+  // `{{itemVar.field}}` binding to a rich-text `itemSchema` field renders as HTML (set:html)
+  // rather than shipping escaped. Keyed by the source PROP name (`bareTemplateIdent` unwraps a
+  // `{{tabs}}` source; a plain `tabs` passes through). Only prop lists have an itemSchema in the
+  // interface, so collection/remote/etc. sources simply find nothing here.
+  const sourceName = typeof node.source === 'string' ? (bareTemplateIdent(node.source) ?? node.source) : undefined;
+  const richItemFields = sourceName ? ctx.richTextItemFields?.get(sourceName) : undefined;
+  if (richItemFields?.size) (ctx.richTextLoopFields ??= []).push({ itemVar, fields: richItemFields });
   ctx.loopVars.push(itemVar);
   const childBlocks = emitChildrenList(itemChildren, ctx);
   ctx.loopVars.pop();
+  if (richItemFields?.size) ctx.richTextLoopFields?.pop();
   if (isCollection && !hadI18nRoot) ctx.i18nRoots.delete(itemVar);
   const childRenderedAt2 = listMapBody(childBlocks);
 
@@ -962,6 +1483,40 @@ function renderList(node: Node, ctx: EmitContext): Rendered {
     return { kind: 'expr', expr: mapExpr };
   }
 
+  if (sourceType === 'remote') {
+    // HTTP-endpoint list: fetch the URL at build/SSR (getRemoteData), then map. The query
+    // carries `path` (where the items array lives in the response) + the shared filter/sort/
+    // limit/offset. No content API — it's a plain fetch. Parser reverses the binding.
+    needRuntime(ctx, 'getRemoteData');
+    const query = listQueryLiteral(node, ctx, ['path', 'filter', 'sort', 'limit', 'offset']);
+    const binding = uniqueBinding(ctx, deriveRemoteBinding(node.url));
+    ctx.frontmatterConsts.push(
+      `const ${binding} = await getRemoteData(${JSON.stringify(node.url ?? '')}, ${query || '{}'}, Astro);`,
+    );
+    return { kind: 'expr', expr: `${binding}.map((${params}) => (\n${childRenderedAt2}\n))` };
+  }
+
+  if (sourceType === 'sanity') {
+    // Sanity GROQ list: fetch the document type at build/SSR (getSanityData). The projectId/
+    // dataset come from project.config.json at RUNTIME (not baked here), so only the document
+    // type + the shared filter/sort/limit/offset query are emitted. Parser reverses the binding.
+    needRuntime(ctx, 'getSanityData');
+    const query = listQueryLiteral(node, ctx, ['filter', 'sort', 'limit', 'offset']);
+    const binding = uniqueBinding(ctx, `${sanitizeIdent(node.documentType ?? 'sanity')}List`);
+    ctx.frontmatterConsts.push(
+      `const ${binding} = await getSanityData(${JSON.stringify(node.documentType ?? '')}, ${query || '{}'}, Astro);`,
+    );
+    return { kind: 'expr', expr: `${binding}.map((${params}) => (\n${childRenderedAt2}\n))` };
+  }
+
+  if (sourceType === 'expression') {
+    // Verbatim-expression list: `<source>.map((item, i) => (…))` over arbitrary frontmatter
+    // data the dialect can't model (an Astro Action result, a supabase query, …). The source
+    // is emitted RAW (no list()/getCollectionList wrapper) — it stands for itself. The item
+    // template still binds `itemVar` via the native `.map` args (rewriteItemRefsInTree above).
+    return { kind: 'expr', expr: `${String(node.source ?? '')}.map((${params}) => (\n${childRenderedAt2}\n))` };
+  }
+
   // prop list
   needRuntime(ctx, 'list');
   const sourceExpr =
@@ -969,7 +1524,10 @@ function renderList(node: Node, ctx: EmitContext): Rendered {
       ? templateToExpr(node.source)
       : sanitizeIdent(String(node.source));
   const opts = listQueryLiteral(node, ctx, ['limit', 'offset']);
-  const listCall = opts ? `list(${sourceExpr}, ${opts})` : `list(${sourceExpr})`;
+  // Use the (possibly aliased) local name for the `list` helper: a prop named `list` shadows
+  // the import, so `list(list)` would call the Array. When aliased, this emits `list$(list)`.
+  const listFn = ctx.runtimeAliases?.get('list') ?? 'list';
+  const listCall = opts ? `${listFn}(${sourceExpr}, ${opts})` : `${listFn}(${sourceExpr})`;
   const expr = `${listCall}.map((${params}) => (\n${childRenderedAt2}\n))`;
   return { kind: 'expr', expr };
 }
@@ -1022,7 +1580,7 @@ function buildItemTemplate(itemVar: string, params: string, childRenderedAt2: st
   const escaped = itemVar.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const fields = new Set<string>(['_id']);
   const scan = JSON.stringify(itemChildren ?? '');
-  for (const m of scan.matchAll(new RegExp(`\\{\\{\\s*${escaped}\\.([\\w$]+)`, 'g'))) fields.add(m[1]);
+  for (const m of scan.matchAll(new RegExp(`\\{\\{\\s*${escaped}\\.([\\w$]+)`, 'g'))) fields.add(m[1] ?? '');
   const synthetic = `{ ${[...fields].map((f) => `${JSON.stringify(f)}: ${JSON.stringify(`{{${itemVar}.${f}}}`)}`).join(', ')} }`;
   return `<template data-meno-item>{[${synthetic}].map((${params}) => (\n${childRenderedAt2}\n))[0]}</template>`;
 }
@@ -1045,7 +1603,7 @@ function queryRefsLoopVar(value: unknown, vars: string[]): boolean {
   if (typeof value === 'string') {
     if (!hasTemplate(value)) return false;
     for (const m of value.matchAll(/\{\{\s*([A-Za-z_$][\w$]*)/g)) {
-      if (vars.includes(m[1])) return true;
+      if (vars.includes(m[1] ?? '')) return true;
     }
     return false;
   }
@@ -1064,6 +1622,19 @@ function sanitizeIdent(s: string): string {
   return /^[A-Za-z_$][\w$]*$/.test(s) ? s : s.replace(/[^A-Za-z0-9_$]/g, '_');
 }
 
+/**
+ * Frontmatter binding name for a remote-data list, derived from its URL's last path segment
+ * (`…/coins/markets?x=1` → `marketsList`). Falls back to `remoteList`. The name is emit-only
+ * (re-derived every emit, deduped by `uniqueBinding`); the model carries the `url`.
+ */
+function deriveRemoteBinding(url: unknown): string {
+  if (typeof url === 'string') {
+    const m = url.replace(/[?#].*$/, '').match(/([A-Za-z0-9_$]+)\/*$/);
+    if (m) return `${sanitizeIdent(m[1] ?? '')}List`;
+  }
+  return 'remoteList';
+}
+
 /** Astro component tag: components must be Capitalized identifiers. */
 export function astroComponentName(name: string): string {
   const cleaned = name.replace(/[^A-Za-z0-9_$]/g, '');
@@ -1072,7 +1643,7 @@ export function astroComponentName(name: string): string {
 
 /** Tag identifiers a user component must never shadow: the dialect's own runtime tags
  *  (parseBody's RUNTIME_TAGS) — `<Link>` etc. would be misread as the runtime element. */
-const RESERVED_IDENTS = new Set(['Link', 'Embed', 'LocaleList', 'BaseLayout', 'Fragment']);
+const RESERVED_IDENTS = new Set(['Link', 'Embed', 'LocaleList', 'BaseLayout', 'Fragment', 'MenoImage', 'Markdown']);
 
 /**
  * The emitted tag identifier for a component name — `astroComponentName` made unique
@@ -1086,10 +1657,72 @@ export function componentIdentFor(ctx: EmitContext, name: string): string {
   if (existing) return existing;
   let base = astroComponentName(name) || 'Component';
   if (!/^[A-Za-z_$]/.test(base)) base = `C${base}`;
-  const taken = new Set(ctx.componentIdents.values());
+  // Islands + custom-`.astro` nodes share the file's tag namespace, so avoid their idents too.
+  const taken = new Set([
+    ...ctx.componentIdents.values(),
+    ...ctx.islandIdents.values(),
+    ...ctx.customAstroIdents.values(),
+  ]);
   let ident = base;
   for (let n = 2; RESERVED_IDENTS.has(ident) || taken.has(ident); n++) ident = `${base}_${n}`;
   ctx.componentIdents.set(name, ident);
+  return ident;
+}
+
+/** Basename of an island `src`, with directory + framework extension stripped. */
+function islandBasename(src: string): string {
+  const base = src.split('/').pop() ?? src;
+  return base.replace(/\.(tsx|jsx|vue|svelte)$/i, '');
+}
+
+/**
+ * The emitted tag identifier for an island `src` — its basename made a unique,
+ * Capitalized JS identifier within the file. Uniquified against BOTH island and
+ * component idents (one shared JSX-tag namespace per file) and the reserved runtime
+ * tags. Deterministic in body render order; the import path carries the true `src`,
+ * so the parser recovers it regardless of the identifier.
+ */
+export function islandIdentFor(ctx: EmitContext, src: string): string {
+  const existing = ctx.islandIdents.get(src);
+  if (existing) return existing;
+  let base = astroComponentName(islandBasename(src)) || 'Island';
+  if (!/^[A-Za-z_$]/.test(base)) base = `I${base}`;
+  const taken = new Set([
+    ...ctx.componentIdents.values(),
+    ...ctx.islandIdents.values(),
+    ...ctx.customAstroIdents.values(),
+  ]);
+  let ident = base;
+  for (let n = 2; RESERVED_IDENTS.has(ident) || taken.has(ident); n++) ident = `${base}_${n}`;
+  ctx.islandIdents.set(src, ident);
+  return ident;
+}
+
+/** Basename of a custom-`.astro` `src`, with directory + `.astro` extension stripped. */
+function customBasename(src: string): string {
+  const base = src.split('/').pop() ?? src;
+  return base.replace(/\.astro$/i, '');
+}
+
+/**
+ * The emitted tag identifier for a custom-`.astro` `src` — its basename made a unique,
+ * Capitalized JS identifier within the file. Uniquified against component AND island idents
+ * (one shared JSX-tag namespace per file) and the reserved runtime tags. Deterministic in
+ * body render order; the import path carries the true `src`, so the parser recovers it.
+ */
+export function customAstroIdentFor(ctx: EmitContext, src: string): string {
+  const existing = ctx.customAstroIdents.get(src);
+  if (existing) return existing;
+  let base = astroComponentName(customBasename(src)) || 'Custom';
+  if (!/^[A-Za-z_$]/.test(base)) base = `C${base}`;
+  const taken = new Set([
+    ...ctx.componentIdents.values(),
+    ...ctx.islandIdents.values(),
+    ...ctx.customAstroIdents.values(),
+  ]);
+  let ident = base;
+  for (let n = 2; RESERVED_IDENTS.has(ident) || taken.has(ident); n++) ident = `${base}_${n}`;
+  ctx.customAstroIdents.set(src, ident);
   return ident;
 }
 
@@ -1120,11 +1753,20 @@ export function renderNode(node: Node, ctx: EmitContext): Rendered {
     case 'embed':
       rendered = renderEmbed(node, ctx);
       break;
+    case 'markdown':
+      rendered = renderMarkdown(node, ctx);
+      break;
     case 'locale-list':
       rendered = renderLocaleList(node, ctx);
       break;
     case 'list':
       rendered = renderList(node, ctx);
+      break;
+    case 'island':
+      rendered = renderIslandInstance(node, ctx);
+      break;
+    case 'custom':
+      rendered = renderCustomAstro(node, ctx);
       break;
     default:
       // Unknown node type → preserve as a comment so nothing is silently dropped.

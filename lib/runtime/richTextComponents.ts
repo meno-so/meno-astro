@@ -69,10 +69,11 @@ export async function expandRichTextComponents(
   // when at least one marker is actually renderable (String.replace can't await).
   const jobs: { index: number; marker: string; component: unknown; props: Record<string, unknown> }[] = [];
   for (const m of html.matchAll(MARKER_RE)) {
-    const component = components?.[m[1]];
+    const name = m[1] ?? '';
+    const component = components?.[name];
     if (!component) continue;
     try {
-      jobs.push({ index: m.index, marker: m[0], component, props: JSON.parse(unescapeAttr(m[2])) });
+      jobs.push({ index: m.index, marker: m[0], component, props: JSON.parse(unescapeAttr(m[2] ?? '')) });
     } catch {
       // malformed props JSON — keep the marker
     }

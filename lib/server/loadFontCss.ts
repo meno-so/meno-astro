@@ -16,8 +16,8 @@
  * build/SSR time, never in the browser.
  */
 
-import { existsSync, readFileSync } from 'fs';
-import { join } from 'path';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 // Import from the `meno-core/shared` barrel (not the deep `./fontCss` path): the
 // published meno-core bundles shared modules into the barrel and does not emit
 // `dist/lib/shared/fontCss.js`, so the deep path would 404 in a consumer project.

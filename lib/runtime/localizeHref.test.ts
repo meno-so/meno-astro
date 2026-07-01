@@ -1,7 +1,7 @@
 import { test, expect, describe, afterEach } from 'bun:test';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
-import { tmpdir } from 'os';
-import { join, dirname } from 'path';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
 import { localizeHref, localizeHrefFor, localizeRichTextLinks } from './localizeHref';
 import { runWithLocale } from './i18n';
 import { clearSlugMappingsCache } from '../server/loadSlugMappings';

@@ -26,9 +26,9 @@
 
 import { resolveCmsItemUrls } from '../server/loadCmsSlugMappings';
 
-type GetCollection = (name: string) => Promise<Array<{ id?: string; data: Record<string, any> }>>;
+type GetCollection = (name: string) => Promise<Array<{ id?: string; data: Record<string, unknown> }>>;
 
-type Item = Record<string, any>;
+type Item = Record<string, unknown>;
 type SortConfig = { field: string; order?: 'asc' | 'desc' };
 type FilterCondition = { field: string; operator?: string; value?: unknown };
 

@@ -74,12 +74,7 @@ const PAGE_HTML = `
 
 interface Resolver {
   identify: (el: Element | null) => { chain: string[]; path: string; item: string } | null;
-  resolveTarget: (t: {
-    chain: string[];
-    path: string;
-    isComponent: boolean;
-    item?: string;
-  }) => Element | null;
+  resolveTarget: (t: { chain: string[]; path: string; isComponent: boolean; item?: string }) => Element | null;
 }
 
 let doc: Document;
@@ -168,23 +163,21 @@ describe('resolveTarget (draw side) — identify()’s inverse', () => {
     // "0,0" exists as the hero h1 (page... Hero-file) AND the Card-internal
     // spans. The chain decides; no document-order fallback may cross files.
     expect(resolver.resolveTarget({ chain: ['0,0'], path: '0,0', isComponent: false })?.id).toBe('hero-h1');
-    expect(
-      resolver.resolveTarget({ chain: ['0,1', '0,0,2'], path: '0,0', isComponent: false, item: '1' })?.id,
-    ).toBe('card1-span');
+    expect(resolver.resolveTarget({ chain: ['0,1', '0,0,2'], path: '0,0', isComponent: false, item: '1' })?.id).toBe(
+      'card1-span',
+    );
   });
 
   test('nested-list item paths pick the exact inner copy', () => {
-    expect(
-      resolver.resolveTarget({ chain: [], path: '0,2,0,1,0', isComponent: false, item: '1.1' })?.id,
-    ).toBe('feat1-inner1');
+    expect(resolver.resolveTarget({ chain: [], path: '0,2,0,1,0', isComponent: false, item: '1.1' })?.id).toBe(
+      'feat1-inner1',
+    );
   });
 
   test('lenient prefix match: an outer container matches a deeper item path (SSR parity)', () => {
     // Selection captured "1.0" from an inner-list descendant; the bordered
     // container (outer li) only carries level "1" — prefix match wins.
-    expect(
-      resolver.resolveTarget({ chain: [], path: '0,2,0', isComponent: false, item: '1.0' })?.id,
-    ).toBe('feat1');
+    expect(resolver.resolveTarget({ chain: [], path: '0,2,0', isComponent: false, item: '1.0' })?.id).toBe('feat1');
   });
 
   test('returns null rather than a wrong element/copy when nothing matches', () => {

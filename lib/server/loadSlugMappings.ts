@@ -50,8 +50,8 @@
  * unreadable/unparseable page degrades to its `_default` entry.
  */
 
-import { existsSync, readdirSync, readFileSync, statSync } from 'fs';
-import { join, relative, sep } from 'path';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { join, relative, sep } from 'node:path';
 import { readPageMeta } from '../dialect/parse/parseFrontmatter';
 import { loadI18nConfig } from './loadI18nConfig';
 import { loadCmsSlugMappings, clearCmsSlugMappingsCache } from './loadCmsSlugMappings';
@@ -124,7 +124,10 @@ export function loadPageSlugMappings(projectRoot: string): SlugMap[] {
     for (const file of files) {
       seen.add(file);
       // `about.astro` → "about", `index.astro` → "index", `docs/intro.astro` → "docs/intro".
-      const pageId = relative(pagesDir, file).split(sep).join('/').replace(/\.astro$/, '');
+      const pageId = relative(pagesDir, file)
+        .split(sep)
+        .join('/')
+        .replace(/\.astro$/, '');
       try {
         const mtimeMs = statSync(file).mtimeMs;
         const cached = fileCache.get(file);
@@ -157,9 +160,7 @@ export function loadPageSlugMappings(projectRoot: string): SlugMap[] {
   // `_default` entries (slugless pages) already carry the filename and stay untouched.
   const { defaultLocale } = loadI18nConfig(projectRoot);
   const normalized = mappings.map((m) =>
-    '_default' in m.slugs
-      ? m
-      : { ...m, slugs: { ...m.slugs, [defaultLocale]: m.pageId === 'index' ? '' : m.pageId } },
+    '_default' in m.slugs ? m : { ...m, slugs: { ...m.slugs, [defaultLocale]: m.pageId === 'index' ? '' : m.pageId } },
   );
   return normalized.sort((a, b) => a.pageId.localeCompare(b.pageId));
 }
@@ -190,8 +191,7 @@ export function has404Page(projectRoot: string): boolean {
  * exactly like page URLs. Deterministic order (sorted by pageId); never throws.
  */
 export function loadSlugMappings(projectRoot: string): SlugMap[] {
-  return [
-    ...loadPageSlugMappings(projectRoot),
-    ...loadCmsSlugMappings(projectRoot).map((e) => e.map),
-  ].sort((a, b) => a.pageId.localeCompare(b.pageId));
+  return [...loadPageSlugMappings(projectRoot), ...loadCmsSlugMappings(projectRoot).map((e) => e.map)].sort((a, b) =>
+    a.pageId.localeCompare(b.pageId),
+  );
 }

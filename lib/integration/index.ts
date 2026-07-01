@@ -21,16 +21,26 @@
  * correct-by-design against the documented integration API.
  */
 
-import { readFileSync, writeFileSync, existsSync, statSync, createReadStream, cpSync } from 'fs';
-import { join, extname, sep, normalize } from 'path';
+import { readFileSync, writeFileSync, existsSync, statSync, createReadStream, cpSync } from 'node:fs';
+import { join, extname, sep, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadI18nConfig } from '../server/loadI18nConfig';
 import { loadSiteUrl } from '../server/loadSiteUrl';
 import { loadSlugMappings } from '../server/loadSlugMappings';
+import { loadAstroConfigExtras } from '../server/loadAstroConfigExtras';
+import { loadEnvConfig, buildEnvSchema } from '../server/loadEnvConfig';
+import { envField } from 'astro/config';
+import { loadSitemapMeta } from '../server/loadSitemapMeta';
 import { readScaleConfigSync } from '../server/scaleConfig';
+import { readKnownTokensSync } from '../server/tokenConfig';
+import { readRemConfigSync } from '../server/remConfig';
+import { createRequire } from 'node:module';
+import { ISLAND_FRAMEWORK_SPECS } from '../server/islandFrameworks';
+import { ASTRO_ADAPTER_SPECS } from '../server/adapters';
 import { buildSitemapXml } from './sitemap';
 import { buildUtilityStylesheet, walkAstroFiles, type UtilitySource } from './utilityCss';
 import { xrayVitePlugin, PLAY_XRAY_BRIDGE_SCRIPT } from './xray';
+import { rewriteViewportUnitsInStylesheet } from './viewportUnits';
 import { PLAY_DESIGN_BRIDGE_SCRIPT } from './designBridge';
 import { playPatchVitePlugin, PLAY_PATCH_BRIDGE_SCRIPT } from './playPatch';
 import type { I18nConfig } from 'meno-core/shared';
@@ -210,7 +220,11 @@ export function collectUtilitySources(projectRoot: string): UtilitySource[] {
   try {
     if (existsSync(srcDir)) {
       walkAstroFiles(srcDir, (p) => {
-        try { sources.push({ src: readFileSync(p, 'utf8'), path: p }); } catch { /* skip unreadable */ }
+        try {
+          sources.push({ src: readFileSync(p, 'utf8'), path: p });
+        } catch {
+          /* skip unreadable */
+        }
       });
     }
   } catch {
@@ -280,7 +294,7 @@ function utilityCssVitePlugin(
   projectRoot: string,
   { sendFullReload = true }: { sendFullReload?: boolean } = {},
 ): { plugin: Record<string, unknown>; controller: UtilityCssController } {
-  const RESOLVED = '\0' + UTILITY_CSS_MODULE;
+  const RESOLVED = `\0${UTILITY_CSS_MODULE}`;
   let css = '';
   const rebuild = (): string => {
     // Read scaling config fresh each rebuild (cheap single-file read) so the per-class
@@ -288,7 +302,29 @@ function utilityCssVitePlugin(
     // emit — without it, token vars scale but literal class properties don't, so play-mode
     // sizes diverge from select mode. A later config edit is picked up on the next rebuild.
     const { breakpoints, responsiveScales } = readScaleConfigSync(projectRoot);
-    css = buildUtilityStylesheet(collectUtilitySources(projectRoot), breakpoints, responsiveScales);
+    // Defined token names (colors + variables) so the bare color-token class form
+    // (`bg-primary`) resolves to its rule, while foreign/authored classes don't.
+    const knownTokens = readKnownTokensSync(projectRoot);
+    // px→rem conversion ("Convert px to rem" project setting) so class-string utility CSS
+    // (`p-[24px]`) ships in rem when enabled — matching meno-core's render path. Read fresh
+    // each rebuild (cheap single-file read); a later config edit is picked up next rebuild.
+    const remConfig = readRemConfigSync(projectRoot);
+    css = buildUtilityStylesheet(
+      collectUtilitySources(projectRoot),
+      breakpoints,
+      responsiveScales,
+      knownTokens,
+      remConfig,
+    );
+    // Editor play/design server only (MENO_PLAY=1): pin viewport units in the
+    // GLOBAL utility sheet too, so the design canvas's `--design-vh/svh/…`
+    // pinning takes hold on class-driven `min-height:100svh` etc. — xray's
+    // transform only reaches per-component `<style>` blocks, never this sheet,
+    // so without this an `svh`/`dvh`/arbitrary-`vh` class couples to the (tall)
+    // design-iframe viewport and a hero fills the whole frame. The var()
+    // fallback makes it a no-op when unpinned; deploy builds (no MENO_PLAY)
+    // keep the literal units. Mirrors core's render-time rewrite.
+    if (process.env[MENO_PLAY_ENV] === '1') css = rewriteViewportUnitsInStylesheet(css);
     return css;
   };
   /** Strip any `?query`/`#hash` suffix so `resolveId`/`load` match every variant. */
@@ -322,7 +358,9 @@ function utilityCssVitePlugin(
   const plugin = {
     name: 'meno-astro:utility-css',
     enforce: 'pre',
-    buildStart() { rebuild(); },
+    buildStart() {
+      rebuild();
+    },
     resolveId(id: string) {
       const base = baseId(id);
       if (base !== UTILITY_CSS_MODULE && base !== RESOLVED) return null;
@@ -336,13 +374,15 @@ function utilityCssVitePlugin(
       return baseId(id) === RESOLVED ? css : null;
     },
     // Dev only: keep the virtual sheet in sync with `.astro` edits and reload the page.
-    configureServer(server: {
-      watcher: { on: (evt: string, cb: (file: string) => void) => void };
-      // Vite ≤5: a single mixed graph. Vite 6+: per-environment graphs (the mixed
-      // `server.moduleGraph` is deprecated and may miss the client `?inline` sheet).
-      ws?: { send: (payload: { type: string }) => void };
-      hot?: { send: (payload: { type: string }) => void };
-    } & InvalidatableServer) {
+    configureServer(
+      server: {
+        watcher: { on: (evt: string, cb: (file: string) => void) => void };
+        // Vite ≤5: a single mixed graph. Vite 6+: per-environment graphs (the mixed
+        // `server.moduleGraph` is deprecated and may miss the client `?inline` sheet).
+        ws?: { send: (payload: { type: string }) => void };
+        hot?: { send: (payload: { type: string }) => void };
+      } & InvalidatableServer,
+    ) {
       const srcDir = join(projectRoot, 'src');
       // `project.config.json` carries the responsive-scaling inputs the sheet is built
       // from (breakpoints + responsiveScales), so a save there must rebuild it too — an
@@ -385,16 +425,28 @@ export const MENO_ASSET_DIRS = ['fonts', 'images', 'icons', 'videos', 'assets', 
 
 /** Content-Type by extension for the dev middleware (octet-stream fallback). */
 const ASSET_MIME: Record<string, string> = {
-  '.woff2': 'font/woff2', '.woff': 'font/woff', '.ttf': 'font/ttf', '.otf': 'font/otf',
-  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp',
-  '.avif': 'image/avif', '.gif': 'image/gif', '.svg': 'image/svg+xml', '.ico': 'image/x-icon',
-  '.mp4': 'video/mp4', '.webm': 'video/webm', '.json': 'application/json',
-  '.js': 'text/javascript', '.css': 'text/css',
+  '.woff2': 'font/woff2',
+  '.woff': 'font/woff',
+  '.ttf': 'font/ttf',
+  '.otf': 'font/otf',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.avif': 'image/avif',
+  '.gif': 'image/gif',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
+  '.json': 'application/json',
+  '.js': 'text/javascript',
+  '.css': 'text/css',
 };
 
 /** The asset dir a request path belongs to (`/fonts/x.woff2` → `fonts`), or null. */
 export function assetDirForPath(urlPath: string): string | null {
-  const seg = urlPath.replace(/^\/+/, '').split('/')[0];
+  const seg = urlPath.replace(/^\/+/, '').split('/')[0] ?? '';
   return (MENO_ASSET_DIRS as readonly string[]).includes(seg) ? seg : null;
 }
 
@@ -467,7 +519,10 @@ function menoAssetsVitePlugin(projectRoot: string): Record<string, unknown> {
           // after statSync — TOCTOU) must not crash it, and a client disconnect must
           // not leak the fd.
           const stream = createReadStream(filePath);
-          stream.on('error', () => { if (!res.headersSent) res.statusCode = 404; res.end(); });
+          stream.on('error', () => {
+            if (!res.headersSent) res.statusCode = 404;
+            res.end();
+          });
           res.on('close', () => stream.destroy());
           stream.pipe(res);
         });
@@ -556,11 +611,7 @@ export const PLAY_MARKER_HEADER = 'x-meno-astro-play';
 interface MarkableServer {
   middlewares: {
     use: (
-      fn: (
-        req: unknown,
-        res: { setHeader: (name: string, value: string) => void },
-        next: () => void,
-      ) => void,
+      fn: (req: unknown, res: { setHeader: (name: string, value: string) => void }, next: () => void) => void,
     ) => void;
   };
 }
@@ -586,6 +637,137 @@ function playMarkerVitePlugin(): Record<string, unknown> {
   };
 }
 
+/** Loose Astro-integration shape — `meno()` returns its own plus framework renderers. */
+type IntegrationLike = { name: string; hooks?: Record<string, unknown> };
+
+/**
+ * Synchronously load the Astro renderer integration for every island framework whose
+ * `@astrojs/<fw>` package is INSTALLED (resolvable from meno-astro). These are returned
+ * as TOP-LEVEL integrations from `meno()` (Astro flattens nested integration arrays), so
+ * each goes through Astro's normal integration phase — its Vite plugin (e.g. the
+ * `astro:react:opts` virtual module the React SSR renderer imports) and `addRenderer`
+ * apply correctly. Registering a renderer integration mid-`config:setup` via
+ * `updateConfig` is too late: Vite is already configured, so the renderer's virtual
+ * modules go unresolved and SSR crashes (`Cannot find package 'astro:react:opts'`).
+ *
+ * Detection is by INSTALLATION, not by scanning `src/islands/`: provisioning installs
+ * only the frameworks a project uses (see `islandFrameworks` / `MENO_ASTRO_FRAMEWORKS`),
+ * so "every installed renderer" == "every framework this project uses". A renderer with
+ * no island is harmless (unused). Sync `require` keeps `meno()` a synchronous factory
+ * (existing configs call `meno()`, not `await meno()`); the runtime — bun (play) or
+ * node ≥22.12 (build) — supports `require()` of these ESM integration packages.
+ */
+/** Island-framework integration packages (`@astrojs/react`, …) resolvable from meno-astro. */
+function installedFrameworkPackages(): string[] {
+  const req = createRequire(import.meta.url);
+  const packages = [...new Set(Object.values(ISLAND_FRAMEWORK_SPECS).map((s) => s.integration))];
+  return packages.filter((pkg) => {
+    try {
+      req.resolve(pkg);
+      return true;
+    } catch {
+      return false; // not installed — this project doesn't use this framework
+    }
+  });
+}
+
+function loadInstalledFrameworkIntegrations(): IntegrationLike[] {
+  const req = createRequire(import.meta.url);
+  const integrations: IntegrationLike[] = [];
+  for (const pkg of installedFrameworkPackages()) {
+    try {
+      const mod = req(req.resolve(pkg));
+      const factory = mod?.default || mod;
+      if (typeof factory === 'function') integrations.push(factory() as IntegrationLike);
+    } catch (err) {
+      console.warn(`[meno-astro] island renderer ${pkg} is installed but failed to load: ${(err as Error).message}`);
+    }
+  }
+  return integrations;
+}
+
+/**
+ * Resolve the SSR adapter integration object when the project opted into `output: 'server'`
+ * (read from `project.config.json` via `loadAstroConfigExtras`). We instantiate
+ * `@astrojs/<name>(opts)` (its default export returns the adapter integration). `meno()` then
+ * registers it TWO ways, both required (verified by the SSR e2e):
+ *   1. `updateConfig({ output: 'server', adapter })` in `astro:config:setup` — sets
+ *      `config.adapter` so the build doesn't fail `NoAdapterInstalled`; and
+ *   2. returning it in the integrations array so its OWN hooks run — its `astro:config:done`
+ *      registers the real `serverEntrypoint`/adapter features (without which the build fails
+ *      to resolve `virtual:astro:legacy-ssr-entry`).
+ * This keeps the project's astro.config exactly `integrations: [meno()]` — it never imports
+ * the adapter (which would trip the play runtime's `ALLOWED_CONFIG_IMPORTS` guard). Returns
+ * `null` (→ static output) when the project is static or the adapter package isn't installed
+ * in the runtime store. `node` carries a `mode` (default `standalone`); others take no options.
+ */
+/**
+ * The options object passed to an adapter factory (`@astrojs/<name>(opts)`). Only `node`
+ * takes options (a `mode`, default `standalone`); the others are called with no args. Pure +
+ * exported so the per-adapter contract is unit-tested without resolving a real package.
+ */
+export function adapterFactoryOptions(adapter: { name: string; mode?: string }): { mode: string } | undefined {
+  return adapter.name === 'node' ? { mode: adapter.mode ?? 'standalone' } : undefined;
+}
+
+function loadAdapterIntegration(projectRoot: string): IntegrationLike | null {
+  const extras = loadAstroConfigExtras(projectRoot);
+  if (extras.output !== 'server' || !extras.adapter) return null;
+  const { name } = extras.adapter;
+  const pkg = ASTRO_ADAPTER_SPECS[name]?.package ?? `@astrojs/${name}`;
+  const req = createRequire(import.meta.url);
+  try {
+    const mod = req(req.resolve(pkg));
+    const factory = mod?.default || mod;
+    if (typeof factory !== 'function') return null;
+    return factory(adapterFactoryOptions(extras.adapter)) as IntegrationLike;
+  } catch (err) {
+    console.warn(
+      `[meno-astro] SSR adapter ${pkg} requested (output: 'server') but not loadable: ${(err as Error).message}. ` +
+        `Falling back to static output.`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Build the `vite.server.fs.allow` list so Astro's dev server can serve island hydration
+ * chunks over `/@fs/…`.
+ *
+ * SSR resolves the island framework renderers fine (Node resolution + `ssr.noExternal`
+ * reach the hoisted deps), but CLIENT hydration fetches e.g. `@astrojs/react/dist/client.js`
+ * over HTTP as `/@fs/<abs>/node_modules/@astrojs/react/dist/client.js`. In the Meno play
+ * runtime those framework deps are HOISTED to the shared workspace `node_modules`, one level
+ * ABOVE the Vite root (the synced project copy) — outside Vite's default fs allow-list — so
+ * the fetch returns `403 Restricted ("outside of Vite serving allow list")` and the island
+ * never hydrates. The nested-copy + hoisted-deps layout also defeats Vite's automatic
+ * workspace-root detection, so we add it explicitly: for each installed renderer (plus
+ * meno-astro's own package, hoisted the same way) we resolve the package and add the parent
+ * of the `node_modules` it resolves from — i.e. the dir that hoists the dep. Astro MERGES
+ * (concatenates) this onto its existing `fs.allow`, so the project copy + Vite client stay
+ * allowed; we only widen it to reach the hoisted chunks.
+ *
+ * Harmless in a real `astro build`/deploy: deps are project-local there and nothing is served
+ * over `/@fs/`, so the extra allow entries are simply never consulted.
+ */
+export function frameworkFsAllow(projectRoot: string): string[] {
+  const req = createRequire(import.meta.url);
+  // The Vite root (project copy) is always allowed; listing it keeps a non-empty allow-list
+  // sane even if every resolve below fails (e.g. nothing installed).
+  const allow = new Set<string>([projectRoot]);
+  const marker = `${sep}node_modules${sep}`;
+  for (const pkg of [...installedFrameworkPackages(), 'meno-astro']) {
+    try {
+      const resolved = req.resolve(pkg); // …/node_modules/<pkg>/dist/…
+      const idx = resolved.lastIndexOf(marker);
+      if (idx !== -1) allow.add(resolved.slice(0, idx)); // parent of node_modules = hoisting root
+    } catch {
+      /* not installed / unresolvable from here — skip */
+    }
+  }
+  return [...allow];
+}
+
 /**
  * The `meno()` Astro integration. Add to a converted project's `astro.config.mjs`:
  *
@@ -602,14 +784,27 @@ function playMarkerVitePlugin(): Record<string, unknown> {
  * bridge. On `astro:build:done` it copies the project's root-level asset dirs into
  * the build output and writes `sitemap.xml` (when the project has a `siteUrl`).
  */
-export default function meno(): MenoIntegration {
+export default function meno(): IntegrationLike[] {
   // Captured in `astro:config:setup` and reused in `astro:build:done` (Astro runs the
   // former first). Defaults to cwd so the build hook is safe even if setup didn't run.
   let projectRoot = process.cwd();
-  return {
+  // Resolve the SSR adapter up front (Astro runs `meno()` in the project dir, so cwd is the
+  // project root): registering it as a top-level integration is the only place its
+  // `astro:config:done`/`setAdapter` applies. `null` ⇒ static output (the default). The
+  // matching `output: 'server'` is set in `astro:config:setup` below, gated on this resolving.
+  const adapterIntegration = loadAdapterIntegration(projectRoot);
+  const base: MenoIntegration = {
     name: 'meno-astro',
     hooks: {
-      'astro:config:setup': ({ config, command, updateConfig, addMiddleware, injectScript, injectRoute, addWatchFile }) => {
+      'astro:config:setup': ({
+        config,
+        command,
+        updateConfig,
+        addMiddleware,
+        injectScript,
+        injectRoute,
+        addWatchFile,
+      }) => {
         projectRoot = resolveProjectRoot(config?.root);
         const i18nConfig = loadI18nConfig(projectRoot);
         const isPlayMode = process.env[MENO_PLAY_ENV] === '1';
@@ -619,11 +814,23 @@ export default function meno(): MenoIntegration {
         // Everything below derives from project.config.json and is frozen at setup
         // time — Astro's i18n routing options, the `site` origin, and whether the
         // locale route is injected at all. Watching the file makes `astro dev`
-        // restart (re-running this hook) on every editor config save, so adding a
-        // locale takes effect live instead of 404ing until a manual stop/start.
+        // restart (re-running this hook) on every config save, so adding a locale
+        // takes effect live instead of 404ing until a manual stop/start.
         // (The per-render loaders — loadI18nConfig/loadSiteUrl/slug maps — are
         // mtime-fresh on their own; this covers the setup-frozen half.)
-        addWatchFile?.(join(projectRoot, 'project.config.json'));
+        //
+        // BUT NOT in play mode: the editor writes project.config.json on every
+        // settings tweak (devToolbar, prefetch, SEO, custom code, …), and a config
+        // watch-file turns EACH of those saves into a full dev-server restart. In the
+        // embedded play iframe that blanket restart drops the HMR socket and blanks the
+        // preview — the "I changed a setting and play died" symptom. Play instead gets a
+        // SURGICAL restart from the studio host: its play-workdir mirror watcher diffs the
+        // config:setup-frozen subset (i18n routing/locales, site, redirects, image,
+        // prefetch, devToolbar) and restarts the server ONLY when one of those actually
+        // changes (see studio astro-dev-server serve.ts scheduleConfigSetupRestart), while
+        // the frequent non-frozen saves leave the server up (per-render loaders reflect
+        // them live). So play keeps an always-on server AND still applies frozen changes.
+        if (!isPlayMode) addWatchFile?.(join(projectRoot, 'project.config.json'));
 
         // (a)+(b) Configure Astro's native i18n routing from the Meno project config,
         //     and register the build-time utility-CSS vite plugin (serves the global
@@ -640,10 +847,7 @@ export default function meno(): MenoIntegration {
         //     editor's preview workdir resolves meno-astro upward from a shared
         //     store without declaring it, so exclude explicitly here.
         const utilityCss = utilityCssVitePlugin(projectRoot, { sendFullReload: !isPlayDev });
-        const vitePlugins = [
-          utilityCss.plugin,
-          menoAssetsVitePlugin(projectRoot),
-        ];
+        const vitePlugins = [utilityCss.plugin, menoAssetsVitePlugin(projectRoot)];
         // Play mode only: mark every response so the Electron shell exempts the
         // play preview from its localhost CSP injection (see PLAY_MARKER_HEADER),
         // and stamp serve-time element-path attributes so the editor's X-Ray
@@ -659,13 +863,67 @@ export default function meno(): MenoIntegration {
         // config didn't already set one — explicit user config always wins.
         const siteUrl = loadSiteUrl(projectRoot);
 
+        // Island framework renderers (`@astrojs/react`, …) live in the shared play-runtime
+        // store, OUTSIDE the project workdir — so Vite would externalize them in SSR and
+        // node would load e.g. `@astrojs/react/dist/server.js` directly, failing to resolve
+        // its `astro:react:opts` virtual module (a Vite-plugin-provided id). Force Vite to
+        // process them (same `noExternal` trick meno-astro uses for its own `.astro`
+        // components) so their renderer's virtual modules resolve. No-op when no island
+        // framework is installed.
+        const noExternal = ['meno-astro', ...installedFrameworkPackages()];
+
+        // Visually-configured Astro options mapped from project.config.json (Studio settings):
+        // `redirects` (the Redirects table), `image.domains` (remote hosts the optimizing
+        // <Image> may process), `prefetch` (Meno's PrefetchConfig → Astro's native prefetch),
+        // and `devToolbar`. Only keys the project actually set are present, so an unset option
+        // keeps Astro's default. See loadAstroConfigExtras.
+        const extras = loadAstroConfigExtras(projectRoot);
+
+        // Two of the extras get special handling so they behave sanely:
+        //   - `devToolbar`: the editor's "Show the Astro dev toolbar while previewing" toggle.
+        //     Astro DEFAULTS the toolbar ON in dev, so we ALWAYS pass an explicit `enabled` —
+        //     `true` only when the user actually ticked it — to make "off by default to keep the
+        //     preview clean" real (otherwise play/dev would show it uninvited). It IS honored in
+        //     play: that's the whole point of the toggle (preview = the play iframe).
+        //   - `prefetch`: the project's PrefetchConfig maps to `prefetchAll`, which on first
+        //     paint fires a prefetch for every same-origin link. In the embedded play iframe
+        //     that's a flood of parallel route compiles against the single dev server (stalls
+        //     first paint) with no benefit — a production / standalone-dev concern only — so it
+        //     is dropped in play and applied everywhere else.
+        // `redirects` and `image.domains` are correctness features (real navigation + MenoImage
+        // remote-source optimization) and apply everywhere.
+        const behavioralExtras = {
+          devToolbar: { enabled: extras.devToolbar?.enabled === true },
+          ...(!isPlayMode && extras.prefetch ? { prefetch: extras.prefetch } : {}),
+        };
+
+        // Typed env vars (astro:env): map the project's `env` schema to Astro's `env.schema`.
+        // Opt-in — projects without an `env` array get nothing, so existing builds are unchanged.
+        const envVars = loadEnvConfig(projectRoot);
+        const envSchema = envVars.length ? buildEnvSchema(envVars, envField) : undefined;
+
         updateConfig({
           ...(siteUrl && !config?.site ? { site: siteUrl } : {}),
+          ...(extras.redirects ? { redirects: extras.redirects } : {}),
+          ...(extras.image ? { image: extras.image } : {}),
+          // SSR opt-in: set `output: 'server'` + the resolved adapter ONLY when the adapter
+          // actually loaded (a requested-but-missing adapter degrades to a clean static build,
+          // not a hard fail). The adapter is set via the `adapter` CONFIG field — the canonical
+          // registration (same as `defineConfig({ adapter: node() })`); returning it as a plain
+          // integration runs its hooks but never marks it as THE adapter (→ NoAdapterInstalled).
+          ...(adapterIntegration ? { output: 'server' as const, adapter: adapterIntegration } : {}),
+          ...(envSchema ? { env: { schema: envSchema } } : {}),
+          ...behavioralExtras,
           i18n: toAstroI18nOptions(i18nConfig),
           vite: {
             plugins: vitePlugins,
             optimizeDeps: { exclude: ['meno-astro'] },
-            ssr: { noExternal: ['meno-astro'] },
+            ssr: { noExternal },
+            // Let `astro dev` serve island hydration chunks (`@astrojs/<fw>/dist/client.js`)
+            // that live in the play runtime's HOISTED workspace node_modules, outside the
+            // Vite root — otherwise the `/@fs/…` fetch 403s and the island never hydrates.
+            // Astro concatenates this onto its own fs.allow; inert in a real build (no /@fs/).
+            server: { fs: { allow: frameworkFsAllow(projectRoot) } },
           },
         });
 
@@ -730,6 +988,7 @@ export default function meno(): MenoIntegration {
           siteUrl,
           loadI18nConfig(projectRoot),
           loadSlugMappings(projectRoot),
+          loadSitemapMeta(projectRoot),
         );
         // null = nothing worth writing (no pages / only error routes) — leave no file.
         // Best-effort like the asset copy: a failed write must not fail the build.
@@ -743,4 +1002,12 @@ export default function meno(): MenoIntegration {
       },
     },
   };
+  // Astro flattens nested integration arrays, so returning [meno, react, …, node] registers
+  // the installed island-framework renderers AND the SSR adapter as TOP-LEVEL integrations
+  // alongside meno(). The adapter needs BOTH: its hooks must run here (so its
+  // `astro:config:done` sets the real serverEntrypoint — without it the build fails with
+  // `virtual:astro:legacy-ssr-entry` unresolved) AND `config.adapter` must be set in
+  // config:setup (without it the build fails `NoAdapterInstalled`). meno() does both — the
+  // updateConfig above sets `adapter`, this returns its integration. Verified by the SSR e2e.
+  return [base, ...loadInstalledFrameworkIntegrations(), ...(adapterIntegration ? [adapterIntegration] : [])];
 }

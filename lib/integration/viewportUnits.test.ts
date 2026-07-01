@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test';
-import { rewriteViewportUnits } from './viewportUnits';
+import { rewriteViewportUnits, rewriteViewportUnitsInStylesheet } from './viewportUnits';
 
 describe('rewriteViewportUnits', () => {
   test('rewrites plain vh/vw through the pinnable custom property', () => {
@@ -23,6 +23,19 @@ describe('rewriteViewportUnits', () => {
     expect(rewriteViewportUnits('.mh-100vh { color: red; }')).toBe('.mh-100vh { color: red; }');
   });
 
+  test('preserves arbitrary-value class selectors, rewriting only the value', () => {
+    // `.min-h-[100svh]` is the literal class on the element; only the declaration
+    // value may be rewritten, or the selector stops matching and the design-mode
+    // pin silently breaks (`100svh` then couples to the iframe viewport).
+    expect(rewriteViewportUnits('.min-h-\\[100svh\\] { min-height: 100svh; }')).toBe(
+      '.min-h-\\[100svh\\] { min-height: calc(var(--design-svh, 1svh) * 100); }',
+    );
+    // Arbitrary value carrying a calc(): selector still preserved.
+    expect(rewriteViewportUnits('.h-\\[50dvh\\] { height: calc(50dvh - 1rem); }')).toBe(
+      '.h-\\[50dvh\\] { height: calc(calc(var(--design-dvh, 1dvh) * 50) - 1rem); }',
+    );
+  });
+
   test('is a no-op on empty / vh-free input', () => {
     expect(rewriteViewportUnits('')).toBe('');
     expect(rewriteViewportUnits('color: red;')).toBe('color: red;');
@@ -37,5 +50,48 @@ describe('rewriteViewportUnits', () => {
     expect(rewriteViewportUnits('max-height: 90vh; min-height: 100dvh;')).toBe(
       'max-height: calc(var(--design-vh, 1vh) * 90); min-height: calc(var(--design-dvh, 1dvh) * 100);',
     );
+  });
+});
+
+describe('rewriteViewportUnitsInStylesheet', () => {
+  test('preserves an escaped selector carrying a DECIMAL viewport unit (the clamp-in-text bug)', () => {
+    // `text-[clamp(56px,9.5vw,150px)]` escapes to `…9\.5vw…`; the value-level
+    // rewriter matches the `.5vw` after the backslash and corrupts the selector,
+    // so the rule is dropped and the heading falls back to the UA default size.
+    // The stylesheet-scoped rewrite touches only the declaration body.
+    const rule = '.text-\\[clamp\\(56px\\,9\\.5vw\\,150px\\)\\] { font-size: clamp(56px,9.5vw,150px); }';
+    expect(rewriteViewportUnitsInStylesheet(rule)).toBe(
+      '.text-\\[clamp\\(56px\\,9\\.5vw\\,150px\\)\\] { font-size: clamp(56px,calc(var(--design-vw, 1vw) * 9.5),150px); }',
+    );
+    // Guard the rationale: the raw value rewriter alone corrupts this selector.
+    expect(rewriteViewportUnits(rule).split('{')[0]).toContain('calc(');
+  });
+
+  test('preserves an escaped selector when a viewport unit follows a no-space comma', () => {
+    // `p-[80px_clamp(20px,5vw,64px)]` — the `5vw` sits right after an escaped
+    // comma (`\,5vw`), the other lookbehind gap. Body-only rewrite keeps it safe.
+    const rule = '.p-\\[80px_clamp\\(20px\\,5vw\\,64px\\)\\] { padding: 80px clamp(20px,5vw,64px); }';
+    expect(rewriteViewportUnitsInStylesheet(rule)).toBe(
+      '.p-\\[80px_clamp\\(20px\\,5vw\\,64px\\)\\] { padding: 80px clamp(20px,calc(var(--design-vw, 1vw) * 5),64px); }',
+    );
+  });
+
+  test('rewrites declaration values inside @media blocks while keeping nested selectors literal', () => {
+    const sheet = '@media (max-width: 767px) { .h-\\[50dvh\\] { height: 50dvh; } }';
+    expect(rewriteViewportUnitsInStylesheet(sheet)).toBe(
+      '@media (max-width: 767px) { .h-\\[50dvh\\] { height: calc(var(--design-dvh, 1dvh) * 50); } }',
+    );
+  });
+
+  test('handles multiple rules and leaves plain-CSS selectors untouched', () => {
+    const sheet = '.a { top: 10vh; } .b { left: 20vw; }';
+    expect(rewriteViewportUnitsInStylesheet(sheet)).toBe(
+      '.a { top: calc(var(--design-vh, 1vh) * 10); } .b { left: calc(var(--design-vw, 1vw) * 20); }',
+    );
+  });
+
+  test('is a no-op on empty / brace-free / vh-free input', () => {
+    expect(rewriteViewportUnitsInStylesheet('')).toBe('');
+    expect(rewriteViewportUnitsInStylesheet('.a { color: red; }')).toBe('.a { color: red; }');
   });
 });

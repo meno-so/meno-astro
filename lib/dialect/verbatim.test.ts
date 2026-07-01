@@ -64,6 +64,17 @@ describe('verbatim code: round-trips in every value position', () => {
     );
   });
 
+  test('a multi-line backtick template literal inside a _code expr keeps its significant indentation', () => {
+    // dedentCode strips CODE indentation but must NOT touch whitespace inside a template literal —
+    // that whitespace is string content. Here the `    return 1` line + closing backtick are indented.
+    const expr = 'hl`def f():\n    return 1\n    `';
+    const model = comp({ type: 'node', tag: 'pre', children: [code(expr)] });
+    assertRoundTrip(model);
+    // and the verbatim string survives the full round-trip byte-for-byte
+    const back = (parse(emit(model)).model as any).component.structure.children[0];
+    expect(back.expr).toBe(expr);
+  });
+
   test('verbatim alongside real children and bindings', () => {
     assertRoundTrip(
       comp({
@@ -125,8 +136,8 @@ describe('verbatim code: regions reporting', () => {
     );
     const { regions } = parse(src);
     expect(regions.length).toBe(1);
-    expect(regions[0].kind).toBe('verbatim');
-    expect(src.slice(regions[0].start, regions[0].end)).toContain('(a * b).toFixed(2)');
+    expect(regions[0]!.kind).toBe('verbatim');
+    expect(src.slice(regions[0]!.start, regions[0]!.end)).toContain('(a * b).toFixed(2)');
   });
 
   test('no verbatim code → no regions (unchanged for ordinary models)', () => {
@@ -148,7 +159,7 @@ describe('verbatim code: regions reporting', () => {
     const { regions } = parse(src);
     expect(regions.length).toBe(2);
     expect(regions.every((r) => r.kind === 'verbatim')).toBe(true);
-    expect(regions[0].start).toBeLessThan(regions[1].start);
+    expect(regions[0]!.start).toBeLessThan(regions[1]!.start);
   });
 });
 

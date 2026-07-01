@@ -19,8 +19,44 @@ export interface EmitContext {
    * name — the parser maps tags back through it (ParseContext.componentImports).
    */
   componentIdents: Map<string, string>;
+  /**
+   * `src` values of island nodes referenced in the body (a BYO framework component file
+   * under `src/islands/`, e.g. `"Counter.tsx"`). Each needs a default import; the page/
+   * component assembler resolves the relative path (see `islandImportPath`).
+   */
+  islands: Set<string>;
+  /**
+   * Island `src` → its emitted tag identifier (`islandIdentFor`). Shares the file's tag
+   * namespace with `componentIdents` (both end up as JSX tags), so the two are uniquified
+   * against each other to avoid a collision like a `Counter.tsx` island next to a `Counter`
+   * component.
+   */
+  islandIdents: Map<string, string>;
+  /**
+   * `src` values of custom-`.astro` nodes (`type:"custom"`) referenced in the body — a
+   * hand-authored `.astro` component under `src/custom/` that Meno treats as an OPAQUE
+   * black box (it renders server-side in a real build but isn't modeled/editable, the
+   * sibling of an island but native to Astro). Each needs a default import; the page/
+   * component assembler resolves the relative path (see `customAstroImportPath`).
+   */
+  customAstro: Set<string>;
+  /**
+   * Custom-`.astro` `src` → its emitted tag identifier (`customAstroIdentFor`). Shares the
+   * file's tag namespace with `componentIdents`/`islandIdents` (all three become JSX tags),
+   * so they are uniquified against each other.
+   */
+  customAstroIdents: Map<string, string>;
   /** Symbols imported from `meno-astro` (e.g. style, i18n, list, getCollectionList, when, embedHtml). */
   runtime: Set<string>;
+  /**
+   * Runtime helper → emitted local name, when the helper's own name collides with a
+   * destructured prop local that would shadow it (e.g. a prop named `list` shadows the
+   * `list()` helper → `list(list)` calls the Array). The helper is imported aliased
+   * (`import { list as list$ }`) and called by the alias, so the prop reference stays the
+   * bare name. Only set for the `list` helper today (its single call site is rerouted; the
+   * import emission + parse resolve the alias from the import line). Empty/absent = no alias.
+   */
+  runtimeAliases?: Map<string, string>;
   /** Astro components imported from `meno-astro/components` (e.g. LocaleList, MenoImage). */
   runtimeComponents: Set<string>;
   /** Frontmatter `const … = …` lines (collection-list queries), in insertion order. */
@@ -62,6 +98,19 @@ export interface EmitContext {
    */
   componentAmbientBindings?: Record<string, string[]>;
   /**
+   * The authoritative set of component names that exist in the project (the keys of
+   * EmitOptions.componentPaths, built by walking EVERY `components/**` file — see
+   * convertProject). Set ONLY when EmitOptions.dropMissingComponents is also true (i.e. the
+   * `convertProject` path, never the editor save path). When present, a `type:"component"`
+   * instance whose name is NOT in this set is a DANGLING reference — its source component was
+   * deleted while a sibling still referenced it (e.g. a `NavLink` deleted from a project whose
+   * `Footer` kept linking it). The emitter renders such a node as nothing instead of a hard
+   * `import X from './X.astro'` to a file that was never emitted (which crashes Astro SSR with
+   * `FailedToLoadModuleSSR: Could not import …`). Mirrors the legacy renderer, which rendered a
+   * missing component as nothing. See `renderComponentInstance` + EmitOptions.dropMissingComponents.
+   */
+  knownComponents?: Set<string>;
+  /**
    * True when the file emits a CMS collection list, so the page/component must
    * `import { getCollection } from 'astro:content'` and pass it to getCollectionList
    * (meno-astro never imports astro:content itself — see runtime/collectionList).
@@ -102,6 +151,25 @@ export interface EmitContext {
    * undefined on pages (which have no prop interface).
    */
   richTextProps?: Set<string>;
+  /**
+   * For each `type:"list"` prop, the names of its `itemSchema` fields declared
+   * `type:"rich-text"`. Keyed by the LIST prop name (the list's `source`). A text child that
+   * is a member ref to one (`{{tab.title}}` inside `list(tabs).map((tab) => …)`) renders as
+   * real HTML via `<Fragment set:html={richTextWithComponents(tab.title, cmsComponents)} />` —
+   * the list-item analog of `richTextProps`, so a rich-text field inside a loop doesn't ship
+   * ESCAPED (`{tab.title}` → literal `<br>`/`<span>`/`<div>` text). Set by emitComponent before
+   * the body walk; consumed via the `richTextLoopFields` stack renderList pushes while it emits
+   * a list's children.
+   */
+  richTextItemFields?: Map<string, Set<string>>;
+  /**
+   * Active loop frames while emitting inside `list(source).map((itemVar) => …)`: the loop var
+   * plus the rich-text `itemSchema` field names of that list (looked up from
+   * `richTextItemFields` by the list's `source`). A stack — nested lists push/pop — read by
+   * emitTextChild to recognize a `{{itemVar.field}}` rich-text member binding. Managed by
+   * renderList around the child emit.
+   */
+  richTextLoopFields?: Array<{ itemVar: string; fields: Set<string> }>;
   /**
    * Names of CMS schema fields declared `type:"rich-text"` on a CMS template page
    * (`meta.cms.fields`). A bare `{{cms.<field>}}` text child for one of these renders via
@@ -145,11 +213,16 @@ export function createEmitContext(width = 80): EmitContext {
   return {
     components: new Set(),
     componentIdents: new Map(),
+    islands: new Set(),
+    islandIdents: new Map(),
+    customAstro: new Set(),
+    customAstroIdents: new Map(),
     runtime: new Set(),
     runtimeComponents: new Set(),
     frontmatterConsts: [],
     clientDataCollections: [],
     loopVars: [],
+    richTextLoopFields: [],
     inScope: new Set(),
     i18nRoots: new Set(),
     needsContentApi: false,
@@ -197,6 +270,18 @@ export interface EmitOptions {
    * absent for flat/test emit (forwarding then no-ops). Threaded into EmitContext.
    */
   componentAmbientBindings?: Record<string, string[]>;
+  /**
+   * Set by `convertProject` (NOT the editor save paths). When true AND `componentPaths` is
+   * present (its complete, authoritative registry), a `type:"component"` instance whose name
+   * is NOT in the registry is a DANGLING reference — its source component was deleted while a
+   * sibling kept linking it (e.g. a `Footer` still mapping `links` onto a `<NavLink/>` after
+   * `NavLink.json` was removed). The emitter then renders nothing in its place instead of a
+   * hard `import X from './X.astro'` to a file that was never emitted, which would crash Astro
+   * SSR ("FailedToLoadModuleSSR: Could not import …"). Off for the editor save path, where the
+   * model is a live in-memory tree and dropping a node would diverge it from disk — so save→get
+   * must stay faithful even for a momentarily-missing component. See EmitContext.knownComponents.
+   */
+  dropMissingComponents?: boolean;
 }
 
 /**
@@ -210,7 +295,7 @@ export function relativeComponentImport(fromDir: string, target: string): string
   while (i < f.length && i < t.length && f[i] === t[i]) i++;
   const parts = [...Array(f.length - i).fill('..'), ...t.slice(i)];
   const rel = parts.join('/');
-  return rel.startsWith('.') ? rel : './' + rel;
+  return rel.startsWith('.') ? rel : `./${rel}`;
 }
 
 /** Register a `meno-astro` runtime symbol and return its name (for fluent use). */

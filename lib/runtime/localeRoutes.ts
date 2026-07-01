@@ -92,10 +92,7 @@ export interface LocaleStaticPath {
  * `prefixDefaultLocale: false`). Single-locale configs yield `[]` (the integration also
  * skips injecting the route then — defense in depth).
  */
-export function enumerateLocaleStaticPaths(
-  mappings: SlugMap[],
-  config: I18nConfig,
-): LocaleStaticPath[] {
+export function enumerateLocaleStaticPaths(mappings: SlugMap[], config: I18nConfig): LocaleStaticPath[] {
   if (!config.locales || config.locales.length <= 1) return [];
   const paths: LocaleStaticPath[] = [];
   for (const { code } of config.locales) {
@@ -137,10 +134,7 @@ export function enumerateLocaleStaticPaths(
  * The default locale is never enumerated here: the template's own emitted
  * `getStaticPaths()` boilerplate serves it (static file routes outrank this route).
  */
-export function enumerateCmsLocaleStaticPaths(
-  entries: CmsSlugEntry[],
-  config: I18nConfig,
-): LocaleStaticPath[] {
+export function enumerateCmsLocaleStaticPaths(entries: CmsSlugEntry[], config: I18nConfig): LocaleStaticPath[] {
   if (!config.locales || config.locales.length <= 1) return [];
   const paths: LocaleStaticPath[] = [];
   for (const { code } of config.locales) {
@@ -199,10 +193,7 @@ export const NOT_FOUND_PAGE_ID = '404';
  * managed netlify.toml marker block (meno-core `shared/netlifyLocale404.ts`), written by
  * the converter scaffold and re-synced by the studio save-config route on locale changes.
  */
-export function enumerate404LocaleStaticPaths(
-  has404Page: boolean,
-  config: I18nConfig,
-): LocaleStaticPath[] {
+export function enumerate404LocaleStaticPaths(has404Page: boolean, config: I18nConfig): LocaleStaticPath[] {
   if (!has404Page || !config.locales || config.locales.length <= 1) return [];
   const paths: LocaleStaticPath[] = [];
   for (const { code } of config.locales) {
@@ -324,8 +315,7 @@ function resolveCurrentPage(
   const { pathWithoutLocale } = extractLocaleFromPath(pathname, config);
   const slug = pathWithoutLocale.replace(/^\/+|\/+$/g, '');
   const byLocale =
-    resolveSlugToPageId(slug, currentLocale, index) ??
-    resolveSlugToPageId(slug, config.defaultLocale, index);
+    resolveSlugToPageId(slug, currentLocale, index) ?? resolveSlugToPageId(slug, config.defaultLocale, index);
   if (byLocale) return byLocale;
   const asPageId = slug === '' ? 'index' : slug;
   return mappings.some((m) => m.pageId === asPageId) ? asPageId : undefined;

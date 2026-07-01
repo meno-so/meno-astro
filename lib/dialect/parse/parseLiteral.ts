@@ -28,7 +28,7 @@ const IDENT_START = /[A-Za-z_$]/;
 const IDENT_CHAR = /[A-Za-z0-9_$]/;
 
 function skipWs(src: string, i: number): number {
-  while (i < src.length && WS.has(src[i])) i++;
+  while (i < src.length && WS.has(src[i] ?? '')) i++;
   return i;
 }
 
@@ -58,7 +58,7 @@ function parseString(src: string, i: number): LiteralResult {
 
 function parseNumber(src: string, i: number): LiteralResult {
   let j = i;
-  while (j < src.length && /[-+0-9.eE]/.test(src[j])) j++;
+  while (j < src.length && /[-+0-9.eE]/.test(src[j] ?? '')) j++;
   const raw = src.slice(i, j);
   const n = Number(raw);
   if (Number.isNaN(n) && raw !== 'NaN') fail(src, i, `invalid number "${raw}"`);
@@ -67,9 +67,9 @@ function parseNumber(src: string, i: number): LiteralResult {
 
 function parseKey(src: string, i: number): LiteralResult {
   if (src[i] === '"') return parseString(src, i);
-  if (!IDENT_START.test(src[i])) fail(src, i, 'expected object key');
+  if (!IDENT_START.test(String(src[i]))) fail(src, i, 'expected object key');
   let j = i + 1;
-  while (j < src.length && IDENT_CHAR.test(src[j])) j++;
+  while (j < src.length && IDENT_CHAR.test(src[j] ?? '')) j++;
   return { value: src.slice(i, j), end: j };
 }
 
@@ -127,7 +127,7 @@ function parseArray(src: string, i: number): LiteralResult {
  */
 export function reverseI18nWrap(expr: string): string | null {
   const m = expr.match(/^(?:i18n|richText)\(\s*([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*\)$/);
-  return m ? m[1] : null;
+  return m ? (m[1] ?? null) : null;
 }
 
 /**
@@ -139,7 +139,7 @@ export function reverseI18nWrap(expr: string): string | null {
  */
 export function reverseDeadCmsGuard(expr: string): string | null {
   const m = expr.trim().match(/^typeof cms === 'undefined' \? '' : (cms(?:\.[A-Za-z_$][\w$]*)*)$/);
-  return m ? m[1] : null;
+  return m ? (m[1] ?? null) : null;
 }
 
 /** Reverse a backtick template-literal body to a `{{…}}` template string. Mirrors the
@@ -159,7 +159,7 @@ function reverseBacktickBody(content: string): string {
     if (c === '$' && content[i + 1] === '{') {
       const end = scanBalanced(content, i + 1); // index past the matching '}'
       const inner = content.slice(i + 2, end - 1).trim();
-      out += '{{' + (reverseDeadCmsGuard(inner) ?? reverseI18nWrap(inner) ?? inner) + '}}';
+      out += `{{${reverseDeadCmsGuard(inner) ?? reverseI18nWrap(inner) ?? inner}}}`;
       i = end;
       continue;
     }
@@ -244,7 +244,7 @@ export function parseValueAt(src: string, i: number): LiteralResult {
   if (src.startsWith('true', i) && !IDENT_CHAR.test(src[i + 4] ?? '')) return { value: true, end: i + 4 };
   if (src.startsWith('false', i) && !IDENT_CHAR.test(src[i + 5] ?? '')) return { value: false, end: i + 5 };
   if (src.startsWith('null', i) && !IDENT_CHAR.test(src[i + 4] ?? '')) return { value: null, end: i + 4 };
-  if (c === '-' || c === '+' || (c >= '0' && c <= '9')) return parseNumber(src, i);
+  if (c === '-' || c === '+' || (c !== undefined && c >= '0' && c <= '9')) return parseNumber(src, i);
   if (c !== undefined && IDENT_START.test(c)) return parseExprToken(src, i); // bare expr → {{…}}
   return fail(src, i, `unexpected character "${c ?? '<eof>'}"`);
 }

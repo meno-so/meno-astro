@@ -42,15 +42,9 @@ describe('buildSitemapXml', () => {
     for (const loc of ['https://example.com/about', 'https://example.com/pl/o-nas']) {
       const block = urlBlock(xml, loc);
       expect(block).toContain(`<loc>${loc}</loc>`);
-      expect(block).toContain(
-        '<xhtml:link rel="alternate" hreflang="en-US" href="https://example.com/about"/>',
-      );
-      expect(block).toContain(
-        '<xhtml:link rel="alternate" hreflang="pl-PL" href="https://example.com/pl/o-nas"/>',
-      );
-      expect(block).toContain(
-        '<xhtml:link rel="alternate" hreflang="x-default" href="https://example.com/about"/>',
-      );
+      expect(block).toContain('<xhtml:link rel="alternate" hreflang="en-US" href="https://example.com/about"/>');
+      expect(block).toContain('<xhtml:link rel="alternate" hreflang="pl-PL" href="https://example.com/pl/o-nas"/>');
+      expect(block).toContain('<xhtml:link rel="alternate" hreflang="x-default" href="https://example.com/about"/>');
     }
     // The xhtml namespace is declared because alternates are present.
     expect(xml).toContain('xmlns:xhtml="http://www.w3.org/1999/xhtml"');
@@ -90,9 +84,7 @@ describe('buildSitemapXml', () => {
     )!;
     for (const loc of ['https://example.com/blog/my-post', 'https://example.com/pl/blog/moj-post']) {
       const block = urlBlock(xml, loc);
-      expect(block).toContain(
-        '<xhtml:link rel="alternate" hreflang="en-US" href="https://example.com/blog/my-post"/>',
-      );
+      expect(block).toContain('<xhtml:link rel="alternate" hreflang="en-US" href="https://example.com/blog/my-post"/>');
       expect(block).toContain(
         '<xhtml:link rel="alternate" hreflang="pl-PL" href="https://example.com/pl/blog/moj-post"/>',
       );
@@ -115,12 +107,7 @@ describe('buildSitemapXml', () => {
   });
 
   test('single-locale project: plain sitemap, no alternates, no xhtml namespace', () => {
-    const xml = buildSitemapXml(
-      [{ pathname: '' }, { pathname: 'about/' }],
-      SITE,
-      SINGLE,
-      MAPPINGS,
-    )!;
+    const xml = buildSitemapXml([{ pathname: '' }, { pathname: 'about/' }], SITE, SINGLE, MAPPINGS)!;
     expect(xml).toContain('<url><loc>https://example.com/</loc></url>');
     expect(xml).toContain('<url><loc>https://example.com/about</loc></url>');
     expect(xml).not.toContain('xhtml');
@@ -163,12 +150,7 @@ describe('buildSitemapXml', () => {
 
   test("pathname forms normalize to the same clean URL ('' / 'about/' / 'about/index.html' / '/about')", () => {
     const xml = buildSitemapXml(
-      [
-        { pathname: 'about/' },
-        { pathname: 'about/index.html' },
-        { pathname: '/about' },
-        { pathname: 'about' },
-      ],
+      [{ pathname: 'about/' }, { pathname: 'about/index.html' }, { pathname: '/about' }, { pathname: 'about' }],
       SITE,
       SINGLE,
       [],
@@ -184,12 +166,7 @@ describe('buildSitemapXml', () => {
   });
 
   test('output is sorted and well-formed (header, urlset, trailing newline)', () => {
-    const xml = buildSitemapXml(
-      [{ pathname: 'zeta/' }, { pathname: 'alpha/' }],
-      SITE,
-      SINGLE,
-      [],
-    )!;
+    const xml = buildSitemapXml([{ pathname: 'zeta/' }, { pathname: 'alpha/' }], SITE, SINGLE, [])!;
     expect(xml.startsWith('<?xml version="1.0" encoding="UTF-8"?>\n<urlset ')).toBe(true);
     expect(xml.endsWith('</urlset>\n')).toBe(true);
     expect(xml.indexOf('alpha')).toBeLessThan(xml.indexOf('zeta'));
@@ -199,6 +176,59 @@ describe('buildSitemapXml', () => {
     const xml = buildSitemapXml([{ pathname: 'a&b/' }], SITE, SINGLE, [])!;
     expect(xml).toContain('<loc>https://example.com/a&amp;b</loc>');
     expect(xml).not.toContain('a&b');
+  });
+});
+
+describe('buildSitemapXml — per-page sitemap meta (priority/changefreq/exclude)', () => {
+  test('exclude drops the page (single-locale)', () => {
+    const meta = new Map([['secret', { exclude: true }]]);
+    const xml = buildSitemapXml([{ pathname: '' }, { pathname: 'secret/' }], SITE, SINGLE, [], meta)!;
+    expect(xml).toContain('<loc>https://example.com/</loc>');
+    expect(xml).not.toContain('/secret');
+  });
+
+  test('exclude keyed by every locale variant drops all of them', () => {
+    // The author excludes the `about` page; loadSitemapMeta keys both '/about' and '/pl/o-nas'.
+    const meta = new Map([
+      ['about', { exclude: true }],
+      ['pl/o-nas', { exclude: true }],
+    ]);
+    const xml = buildSitemapXml(
+      [{ pathname: '' }, { pathname: 'about/' }, { pathname: 'pl/o-nas/' }],
+      SITE,
+      CONFIG,
+      MAPPINGS,
+      meta,
+    )!;
+    expect(xml).not.toContain('/about');
+    expect(xml).not.toContain('/pl/o-nas');
+    expect(xml).toContain('<loc>https://example.com/</loc>');
+  });
+
+  test('priority + changefreq are emitted (sitemaps.org order: loc, changefreq, priority)', () => {
+    const meta = new Map([['', { priority: 1, changefreq: 'daily' }]]);
+    const xml = buildSitemapXml([{ pathname: '' }], SITE, SINGLE, [], meta)!;
+    expect(xml).toMatch(
+      /<loc>https:\/\/example\.com\/<\/loc>\s*<changefreq>daily<\/changefreq>\s*<priority>1<\/priority>/,
+    );
+  });
+
+  test('annotations coexist with hreflang alternates', () => {
+    const meta = new Map([
+      ['about', { priority: 0.8, changefreq: 'weekly' }],
+      ['pl/o-nas', { priority: 0.8, changefreq: 'weekly' }],
+    ]);
+    const xml = buildSitemapXml([{ pathname: 'about/' }, { pathname: 'pl/o-nas/' }], SITE, CONFIG, MAPPINGS, meta)!;
+    const block = urlBlock(xml, 'https://example.com/about');
+    expect(block).toContain('<changefreq>weekly</changefreq>');
+    expect(block).toContain('<priority>0.8</priority>');
+    expect(block).toContain('<xhtml:link rel="alternate"');
+  });
+
+  test('pages without meta are unaffected (no annotations)', () => {
+    const xml = buildSitemapXml([{ pathname: 'plain/' }], SITE, SINGLE, [], new Map())!;
+    expect(xml).toContain('<url><loc>https://example.com/plain</loc></url>');
+    expect(xml).not.toContain('<priority>');
   });
 });
 

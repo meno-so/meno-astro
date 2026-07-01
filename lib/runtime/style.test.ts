@@ -12,7 +12,7 @@
  */
 
 import { test, expect, describe } from 'bun:test';
-import { style, mergeInstanceClasses, linkClass, inlineStyle } from './style';
+import { style, mergeInstanceClasses, linkClass, inlineStyle, cx, variants } from './style';
 
 describe('mergeInstanceClasses', () => {
   test('instance class overrides the root class on the same property', () => {
@@ -128,6 +128,17 @@ describe('inlineStyle() — component-root prop-bound inline styles, instance-aw
   test('returns undefined when every declaration is dropped, so Astro omits the attr', () => {
     expect(inlineStyle({}, { class: '' })).toBeUndefined();
   });
+
+  test('a class-based instance override drops the matching inline declaration too', () => {
+    // The instance override now arrives as a class string (<Child class="max-w-[889px]" />), not a
+    // style object. inlineStyle must decode it and drop the root's prop-bound inline max-width so the
+    // instance class wins — same outcome as the __menoStyle path.
+    expect(inlineStyle({ 'max-width': '100%' }, { class: 'max-w-[889px]' })).toBeUndefined();
+    // Only the overridden property is dropped.
+    expect(inlineStyle({ 'max-width': '100%', gap: '12px' }, { class: 'max-w-[889px]' })).toBe('gap: 12px');
+    // A breakpoint-variant token does not suppress the base inline declaration.
+    expect(inlineStyle({ 'max-width': '100%' }, { class: 'tablet:max-w-[889px]' })).toBe('max-width: 100%');
+  });
 });
 
 describe('style() — {{template}} declarations bridge through a CSS variable so interactive rules can override', () => {
@@ -141,13 +152,13 @@ describe('style() — {{template}} declarations bridge through a CSS variable so
     );
     const tokens = out.split(/\s+/);
     expect(tokens).toContain('flex'); // static base prop unaffected
-    expect(tokens).toContain('tablet:opacity-(--m-tablet-opacity)');
-    expect(tokens).toContain('tablet:[pointer-events:var(--m-tablet-pointer-events)]');
+    expect(tokens).toContain('max-lg:opacity-(--m-tablet-opacity)');
+    expect(tokens).toContain('max-lg:[pointer-events:var(--m-tablet-pointer-events)]');
   });
 
   test('a mobile template bridges with the mobile-scoped variable name', () => {
     const out = style({ mobile: { opacity: '{{isOpen ? 1 : 0}}' } }, { isOpen: false });
-    expect(out.split(/\s+/)).toContain('mobile:opacity-(--m-mobile-opacity)');
+    expect(out.split(/\s+/)).toContain('max-sm:opacity-(--m-mobile-opacity)');
   });
 
   test('a NON-ROOT base template ALSO bridges (so a :hover/.is-open rule can override it — the dropdown bug)', () => {
@@ -168,7 +179,7 @@ describe('style() — {{template}} declarations bridge through a CSS variable so
       { root: true },
     );
     expect(out).not.toContain('--m-base-'); // base stays direct
-    expect(out.split(/\s+/)).toContain('tablet:opacity-(--m-tablet-opacity)'); // tablet still bridges
+    expect(out.split(/\s+/)).toContain('max-lg:opacity-(--m-tablet-opacity)'); // tablet still bridges
   });
 });
 
@@ -215,5 +226,38 @@ describe('linkClass() — the intrinsic link UA reset', () => {
     expect(classes).toEqual(
       expect.arrayContaining(['block', 'no-underline', 'text-inherit', 'swiper', 'm_card_abc123']),
     );
+  });
+});
+
+describe('cx', () => {
+  test('drops empty/falsy parts and splits whitespace', () => {
+    expect(cx('p-[8px]', false, null, undefined, '  ')).toBe('p-[8px]');
+    expect(cx('p-[8px] m-[4px]', 'gap-[2px]')).toBe('p-[8px] m-[4px] gap-[2px]');
+  });
+  test('last fragment wins on the same (breakpoint, property) conflict', () => {
+    // both target padding at base → the later one survives, in place of the earlier.
+    expect(cx('p-[8px]', 'p-[16px]')).toBe('p-[16px]');
+  });
+  test('a breakpoint-scoped class does not drop the base class for the same property', () => {
+    // base padding and tablet padding are different merge keys → both kept, order preserved.
+    expect(cx('p-[8px]', 'tablet:p-[16px]')).toBe('p-[8px] tablet:p-[16px]');
+  });
+  test('unrecognized/foreign classes are always kept (never dedup away)', () => {
+    expect(cx('swiper', 'swiper-active', 'p-[8px]')).toBe('swiper swiper-active p-[8px]');
+  });
+});
+
+describe('variants', () => {
+  const table = {
+    size: { sm: 'p-[4px]', lg: 'p-[16px]' },
+    tone: { primary: 'text-[#fff]' },
+  };
+  test('picks the class for the current prop value (string-coerced)', () => {
+    expect(variants({ size: 'lg', tone: 'primary' }, table)).toBe('p-[16px] text-[#fff]');
+  });
+  test('a missing or unmatched prop value contributes nothing', () => {
+    expect(variants({ size: 'xl' }, table)).toBe('');
+    expect(variants({}, table)).toBe('');
+    expect(variants(undefined, table)).toBe('');
   });
 });

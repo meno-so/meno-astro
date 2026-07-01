@@ -1,7 +1,7 @@
 import { test, expect, describe, afterEach } from 'bun:test';
-import { mkdtempSync, writeFileSync, rmSync } from 'fs';
-import { tmpdir } from 'os';
-import { join } from 'path';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { loadI18nConfig } from './loadI18nConfig';
 import { DEFAULT_I18N_CONFIG } from 'meno-core/shared';
 
@@ -33,7 +33,7 @@ describe('loadI18nConfig', () => {
     const cfg = loadI18nConfig(root);
     expect(cfg.defaultLocale).toBe('en');
     expect(cfg.locales.map((l) => l.code)).toEqual(['en', 'pl']);
-    expect(cfg.locales[1].nativeName).toBe('Polski');
+    expect(cfg.locales[1]!.nativeName).toBe('Polski');
   });
 
   test('missing project.config.json -> DEFAULT_I18N_CONFIG', () => {
@@ -59,7 +59,7 @@ describe('loadI18nConfig', () => {
     expect(cfg.locales.map((l) => l.code)).toEqual(['en', 'pl']);
     // migrateLocaleString upper-cases name/nativeName and builds a langTag.
     expect(cfg.locales[1]).toMatchObject({ code: 'pl', name: 'PL', nativeName: 'PL' });
-    expect(cfg.locales[1].langTag).toBe('pl-PL');
+    expect(cfg.locales[1]!.langTag).toBe('pl-PL');
   });
 
   test('unparseable JSON -> DEFAULT_I18N_CONFIG (never throws)', () => {

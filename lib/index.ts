@@ -35,7 +35,32 @@ import { toHtmlString } from './runtime/richText';
 // (+ the generated `src/cmsComponents.ts` registry import) instead of `richText(<chain>)` —
 // an older parse() reads the new call back as a verbatim `{ _code }` marker, not the
 // `{{<chain>}}` binding, so this is a forward-incompatible emitted-shape change.
-export const dialectVersion = '0.1.3' as const;
+// 0.1.4: `<Embed html={ident} />` now resolves a hoisted frontmatter backtick const under ANY
+// name (not only `__embedN`) — parse-side recovery so a hand-authored, custom-named embed hoist's
+// verbatim HTML is no longer silently dropped on round-trip. The EMITTED shape is unchanged (emit
+// still hoists as `__embedN`), so this is parse-only and backward-compatible — bumped to stamp the
+// codec capability into generated projects.
+// 0.1.5: SSR page type (`meta.source: 'ssr'` + `meta.data.sources`) — emits the derived
+// `const { … } = await loadPageData(meta.data, Astro)` boilerplate (+ `const params = Astro.params`
+// for `meta.routeParams` dynamic `[param]` routes) and `export const prerender = false`. An older
+// parse() doesn't recognize the `loadPageData`/`params` consts and would capture them as
+// `_frontmatter` passthrough (duplicating them on re-emit), so this is a forward-incompatible
+// emitted-shape change. Requires the `loadPageData` runtime helper (this package).
+// 0.1.6: Sanity list source (`sourceType: 'sanity'`) — emits `const X = await getSanityData(
+// "<type>", {query}, Astro)`, and a Sanity-backed CMS template emits a `getStaticPaths()` that
+// calls `getSanityData` instead of `getCollection`. An older parse() captures the `getSanityData`
+// const as `_frontmatter` passthrough (duplicating it on re-emit), so this is forward-incompatible.
+// Requires the `getSanityData` runtime helper + `loadSanityConfig` (this package).
+// 0.1.7: rich-text VALUES other than a CMS text child now also render embedded components via the
+// registry: a `type:"rich-text"` PROP child emits `richTextWithComponents(<prop>, cmsComponents)`
+// (was bare `set:html={prop}`), and an embed node bound to a CMS rich-text field emits the extra
+// `components={cmsComponents}` attr (Embed renders the embeds via `richTextWithComponents`). An
+// older parse() mis-reads the prop `richTextWithComponents(...)` call as a verbatim `{ _code }`
+// marker and captures the emit-only `components` attr into the model, so this is a
+// forward-incompatible emitted-shape change. The Embed half needs the updated `Embed.astro`
+// runtime (this package). The registry (`src/cmsComponents.ts`) is now written for any project
+// with components, not just CMS ones (a rich-text prop can appear on a non-CMS page).
+export const dialectVersion = '0.1.7' as const;
 
 // ---------------------------------------------------------------------------
 // Model types re-exported for the dialect + generated projects. These are the
@@ -65,10 +90,7 @@ export type MenoPageMeta = NonNullable<JSONPage['meta']>;
  * `defineVars` is intentionally not here: it is emitted as the script's native
  * `<script define:vars={{…}}>` directive and reconstructed on parse, not via `__meno`.
  */
-export type MenoComponentMeta = Pick<
-  StructuredComponentDefinition,
-  'category' | 'acceptsStyles' | 'libraries'
->;
+export type MenoComponentMeta = Pick<StructuredComponentDefinition, 'category' | 'acceptsStyles' | 'libraries'>;
 
 // ---------------------------------------------------------------------------
 // Curated runtime helpers, composed from meno-core. The dialect-specific wrappers
@@ -185,6 +207,12 @@ export { loadI18nConfig } from './server/loadI18nConfig';
 // not shipped. Touches the filesystem (build/SSR only — runs in BaseLayout frontmatter).
 export { loadSiteUrl } from './server/loadSiteUrl';
 
+// loadSanityConfig — read a converted project's Sanity CMS connection
+// (`integrations.sanity` in project.config.json; null when absent/invalid). Re-exported
+// here so the published `getSanityData` runtime helper can reach it at build/SSR;
+// `meno-astro/server` is workspace-only and not shipped. Filesystem (build/SSR only).
+export { loadSanityConfig, type SanityRuntimeConfig } from './server/loadSanityConfig';
+
 // loadSlugMappings — the project's MERGED slug map (pages' `meta.slugs` + one entry per
 // published CMS item) that drives link localization, LocaleList links, BaseLayout
 // hreflang, and the sitemap. `loadPageSlugMappings`/`loadCmsSlugMappings` are the split
@@ -233,12 +261,40 @@ export type { PageLibrariesMeta } from './server/loadLibraries';
 export { loadIconsConfig } from './server/loadIconsConfig';
 export type { IconsConfig } from './server/loadIconsConfig';
 
+// loadCustomCode / mergeCustomCode — read a project's global `customCode` (head/bodyStart/
+// bodyEnd HTML) and merge it with a page's `meta.customCode` → BaseLayout's arbitrary
+// head/body injection. The dialect twin of meno-core's SSR custom-code block (htmlGenerator
+// merges global + page the same way). Re-exported here so the published BaseLayout can reach
+// it; touches the filesystem (build/SSR only — runs in BaseLayout frontmatter).
+export { loadCustomCode, mergeCustomCode } from './server/loadCustomCode';
+export type { CustomCodeConfig } from './server/loadCustomCode';
+
+// loadSocial — read a project's `social` config (`twitterHandle`) → BaseLayout's
+// twitter:site/creator tags. Re-exported here (alongside loadSiteUrl) so the published
+// BaseLayout can reach it; `meno-astro/server` is workspace-only and not shipped. Touches
+// the filesystem (build/SSR only — runs in BaseLayout frontmatter).
+export { loadSocial } from './server/loadSocial';
+export type { SocialConfig } from './server/loadSocial';
+
+// buildSocialMetaTags — the pure helper that turns a page's native `meta` fields
+// (ogTitle/ogDescription/ogImage/ogType/keywords + project twitterHandle) into the
+// `og:*` / `twitter:*` / `keywords` head tags BaseLayout renders. The dialect twin of
+// meno-core's SSR `generateMetaTags`, minus the title/description/canonical/hreflang
+// BaseLayout already owns; defers to `meta.customCode` to avoid duplicating imported SEO.
+export { buildSocialMetaTags } from './metaTags';
+export type { SocialMetaInput } from './metaTags';
+
+// renderMarkdown — render a `markdown` node's verbatim source to HTML at build/SSR. Used by
+// the Markdown.astro runtime component (emitted for `type:"markdown"` nodes). Mirrors
+// meno-core's shared markdown config so the editor canvas and the real Astro build agree.
+export { renderMarkdown } from './runtime/markdown';
+
 // style() runtime — the emitter-facing style resolver (class-name only). Emitted markup
 // calls `style(styleObject[, props][, meta])` and `style()` returns just the `class={...}`
 // value; the matching utility/interactive CSS is generated at BUILD time by the meno()
 // integration (`virtual:meno-utilities.css`), not collected at render time. See
 // `runtime/style.ts`.
-export { style, inlineStyle } from './runtime/style';
+export { style, inlineStyle, cx, variants } from './runtime/style';
 export type { StyleMeta } from './runtime/style';
 // linkClass() — applies the `link` UA reset (meno-core's `.olink`, as `block no-underline
 // text-inherit`) to a link's class string at render. Used by the Link.astro runtime component
@@ -258,10 +314,7 @@ export { href, embedHtml, when } from './runtime/refs';
  * `when()` / `href()` runtime + the CSS-injection integration are the remaining,
  * Astro-toolchain-verified part of Phase 0b.)
  */
-export function list<T>(
-  source: T[] | null | undefined,
-  opts?: { offset?: number; limit?: number },
-): T[] {
+export function list<T>(source: T[] | null | undefined, opts?: { offset?: number; limit?: number }): T[] {
   let out = Array.isArray(source) ? source : [];
   if (opts?.offset) out = out.slice(opts.offset);
   if (opts?.limit != null) out = out.slice(0, opts.limit);
@@ -275,6 +328,28 @@ export function list<T>(
 // references the outer loop var (a hoisted getCollectionList can't see it). See collectionList.
 export { getCollectionList, queryList, serializeClientCmsData } from './runtime/collectionList';
 export type { CollectionListQuery } from './runtime/collectionList';
+
+// Remote-data list (`sourceType: 'remote'`) — the HTTP-endpoint sibling of getCollectionList:
+//   `const X = await getRemoteData("https://…", { path, sort, limit, … }, Astro)`.
+// Fetches a public JSON endpoint at build/SSR, navigates `path` to the items array, applies
+// the same filter/sort/limit query semantics. See runtime/remoteData.
+export { getRemoteData } from './runtime/remoteData';
+export type { RemoteDataQuery } from './runtime/remoteData';
+
+// Sanity-backed list (`sourceType: 'sanity'`) — the GROQ sibling of getRemoteData:
+//   `const X = await getSanityData("post", { sort, filter, limit, … }, Astro)`.
+// Reads the project's Sanity connection from project.config.json (loadSanityConfig), fetches
+// the public query API (`*[_type == "<type>"]`), reads `payload.result`, and applies the same
+// filter/sort/limit semantics. `buildSanityQueryUrl` is shared with the editor's discovery
+// routes so preview + build hit the same URL. See runtime/sanityData.
+export { getSanityData, buildSanityQueryUrl } from './runtime/sanityData';
+export type { SanityDataQuery } from './runtime/sanityData';
+
+// SSR page data (`meta.source === 'ssr'`) — the page-scope sibling of getRemoteData:
+//   `const { repo, user } = await loadPageData(meta.data, Astro)`.
+// Fetches each declarative source per request, interpolating request inputs, and resolves
+// to objects (with `_ok`/`_error` control fields) or lists. See runtime/pageData.
+export { loadPageData } from './runtime/pageData';
 
 // CMS filter/sort expression parsing + serialization (pure).
 export {
@@ -302,14 +377,19 @@ export {
 // ---------------------------------------------------------------------------
 
 /** Map a single prop definition to the runtime value type of that prop. */
-type InferMenoProp<D> =
-  D extends { type: 'number' } ? number :
-  D extends { type: 'boolean' } ? boolean :
-  D extends { type: 'link' } ? { href: string; target?: string } :
-  D extends { type: 'list' } ? unknown[] :
-  D extends { type: 'select'; options: infer O }
-    ? (O extends readonly (infer U)[] ? U : string)
-    : string; // string, rich-text, image, embed, file → string
+type InferMenoProp<D> = D extends { type: 'number' }
+  ? number
+  : D extends { type: 'boolean' }
+    ? boolean
+    : D extends { type: 'link' }
+      ? { href: string; target?: string }
+      : D extends { type: 'list' }
+        ? unknown[]
+        : D extends { type: 'select'; options: infer O }
+          ? O extends readonly (infer U)[]
+            ? U
+            : string
+          : string; // string, rich-text, image, embed, file → string
 
 /** Map a whole prop-definition record to the destructured locals' value types. */
 type InferMenoProps<T extends MenoProps> = { [K in keyof T]: InferMenoProp<T[K]> };

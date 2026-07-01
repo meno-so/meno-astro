@@ -14,6 +14,8 @@ import { singularize } from 'meno-core/shared';
 import { isStyleMapping } from 'meno-core/shared';
 import { sanitizeCssValue } from '../runtime/cssValue';
 import { isBindableIdent } from './ident';
+import { scanTemplate, scanString } from './parse/scan';
+import { inlineStyleToStyleDecls } from './inlineStyle';
 
 export function hasStyleContent(style: unknown): boolean {
   if (!style || typeof style !== 'object') return false;
@@ -160,13 +162,134 @@ function migrateLegacy(n: Record<string, unknown>): Record<string, unknown> {
   return n;
 }
 
-function normalizeNode(node: unknown): unknown {
+/**
+ * Canonicalize a verbatim multi-line `_code` expression by stripping the common leading
+ * indentation of lines 2..n (line 1 follows `{` so it carries no source indent). The emit placer
+ * re-indents the whole block per nesting level, so an inline multi-line expr (one containing JSX,
+ * which can't hoist to the TS frontmatter) would otherwise re-capture the added indent on each
+ * round-trip and the next emit would add it AGAIN (unbounded drift). Dedenting to a fixed point
+ * here AND in parse's codeMarker makes emit∘parse stable. Single-line exprs are untouched.
+ *
+ * A line whose start is INSIDE a backtick template literal is left alone — that leading whitespace
+ * is significant string content (`` `…\n    sig\n  ` ``), so dedenting it would silently corrupt
+ * the verbatim value the `_code` escape hatch exists to preserve.
+ */
+export function dedentCode(expr: string): string {
+  if (!expr.includes('\n')) return expr;
+  // Offsets inside a template-literal interior are protected (string content, never code indent).
+  // No backtick → cheap path. scanTemplate/scanString skip interpolation + escapes correctly.
+  const protectedRanges: Array<[number, number]> = [];
+  if (expr.includes('`')) {
+    let i = 0;
+    while (i < expr.length) {
+      const c = expr[i];
+      if (c === '`') {
+        const end = scanTemplate(expr, i);
+        protectedRanges.push([i + 1, end - 1]);
+        i = end;
+      } else if (c === '"' || c === "'") {
+        i = scanString(expr, i);
+      } else i++;
+    }
+  }
+  const isProtected = (off: number): boolean => protectedRanges.some(([s, e]) => off >= s && off < e);
+  const lines = expr.split('\n');
+  const starts: number[] = [];
+  for (let k = 0, acc = 0; k < lines.length; k++) {
+    starts.push(acc);
+    acc += lines[k]!.length + 1;
+  }
+  let min = Number.POSITIVE_INFINITY;
+  for (let k = 1; k < lines.length; k++) {
+    const l = lines[k]!;
+    if (!l.trim() || isProtected(starts[k]!)) continue;
+    min = Math.min(min, l.length - l.trimStart().length);
+  }
+  if (!Number.isFinite(min) || min === 0) return expr;
+  return [lines[0], ...lines.slice(1).map((l, idx) => (isProtected(starts[idx + 1]!) ? l : l.slice(min)))].join('\n');
+}
+
+/** The static `base` declaration object of a StyleValue (responsive `{base,…}` or flat), or `{}`. */
+function styleBaseOf(style: unknown): Record<string, unknown> {
+  if (!style || typeof style !== 'object') return {};
+  const s = style as Record<string, unknown>;
+  if ('base' in s || 'tablet' in s || 'mobile' in s) {
+    return s.base && typeof s.base === 'object' ? (s.base as Record<string, unknown>) : {};
+  }
+  return s; // flat
+}
+
+/** Merge `decls` into a StyleValue's base (decls win — an inline `style=` outranks a class in the
+ *  browser, so absorbing it must preserve that precedence). Keeps any tablet/mobile breakpoints. */
+function mergeStyleBase(style: unknown, decls: Record<string, string>): Record<string, unknown> {
+  const s = style && typeof style === 'object' ? { ...(style as Record<string, unknown>) } : {};
+  const responsive = 'base' in s || 'tablet' in s || 'mobile' in s;
+  if (!responsive && Object.keys(s).length > 0) return { ...s, ...decls }; // flat existing style
+  const base = s.base && typeof s.base === 'object' ? (s.base as Record<string, unknown>) : {};
+  s.base = { ...base, ...decls };
+  return s;
+}
+
+/**
+ * Absorb a foreign inline `style=` attribute into `node.style` (one style system, editable in the
+ * Styles panel) — static declarations and CSS-literal-ternary bindings become `style.base`. An
+ * inline style that can't be modeled (a non-CSS-literal dynamic binding) is left as the verbatim
+ * `attributes.style` it already is. Mutates `out`. See ./inlineStyle.
+ */
+function absorbInlineStyle(out: Record<string, unknown>): void {
+  const attrs = out.attributes;
+  if (!attrs || typeof attrs !== 'object') return;
+  const raw = (attrs as Record<string, unknown>).style;
+  if (typeof raw !== 'string') return;
+  const decls = inlineStyleToStyleDecls(raw, styleBaseOf(out.style));
+  if (!decls) return;
+  out.style = mergeStyleBase(out.style, decls);
+  // Replace (don't mutate) the attributes object — normalizeNode shallow-copies the node, so
+  // `attrs` is shared with the input; an in-place delete would corrupt it (e.g. the candidate the
+  // expression-list round-trip gate normalizes for comparison).
+  const nextAttrs = { ...(attrs as Record<string, unknown>) };
+  delete nextAttrs.style;
+  if (Object.keys(nextAttrs).length === 0) delete out.attributes;
+  else out.attributes = nextAttrs;
+}
+
+/**
+ * Does this `<img>` src point at a LOCAL, raster image worth routing through `astro:assets`
+ * (the `<MenoImage>` wrapper)? Local images opt INTO optimization by DEFAULT — `normalizeNode`
+ * stamps the `data-meno-optimize="true"` marker on them, and the editor's "Optimize with Astro"
+ * toggle reads on for them — so every local image lazy-loads / gets responsive output unless the
+ * author explicitly opts out (`data-meno-optimize="false"`). Remote / protocol-relative / data:
+ * / `.svg` srcs are NEVER defaulted (they stay a bare `<img>` unless the marker is set explicitly),
+ * mirroring `MenoImage`'s "optimize only where Astro can" graceful degradation. The editor mirrors
+ * this exact predicate in `PropsPanel/AttributesEditor` to render the same default-on state.
+ */
+export function isLocalOptimizableSrc(src: unknown): boolean {
+  if (typeof src !== 'string') return false;
+  const s = src.trim();
+  if (s === '') return false;
+  if (/^https?:\/\//i.test(s)) return false; // remote — opt-in only (the default is local-scoped)
+  if (s.startsWith('//')) return false; // protocol-relative remote
+  if (/^data:/i.test(s)) return false; // inline data URI — not a fetchable file
+  if (/\.svg(?:[?#]|$)/i.test(s)) return false; // vector — no raster gain, and Image can choke on it
+  return true;
+}
+
+export function normalizeNode(node: unknown): unknown {
   if (typeof node === 'string') return node;
   if (!node || typeof node !== 'object') return node;
-  // Verbatim-code marker ({ _code, expr }) is canonical by construction — pass through
-  // untouched so it stays idempotent and is never mistaken for a structural node.
-  if ((node as Record<string, unknown>)._code === true) return node;
+  // Verbatim-code marker ({ _code, expr }) — canonicalize its indentation (see dedentCode) so it
+  // stays idempotent, then pass through (never mistaken for a structural node).
+  if ((node as Record<string, unknown>)._code === true) {
+    const expr = (node as Record<string, unknown>).expr;
+    return typeof expr === 'string' ? { ...(node as Record<string, unknown>), expr: dedentCode(expr) } : node;
+  }
   const out = migrateLegacy({ ...(node as Record<string, unknown>) });
+
+  // Fold a foreign inline `style=` (kept verbatim by the parser as attributes.style) into the
+  // Meno `node.style` model, so a hand-authored element styles like any other node — one system,
+  // editable in the Styles panel. Runs before the style cleanup below so the merged style is
+  // sanitized. Un-modelable dynamic styles stay as the attributes.style binding they already are.
+  absorbInlineStyle(out);
 
   if ('style' in out && !hasStyleContent(out.style)) delete out.style;
   if (out.style !== undefined) out.style = sanitizeStyleValue(out.style);
@@ -179,13 +302,54 @@ function normalizeNode(node: unknown): unknown {
     delete out.props;
   }
 
+  // Local images opt INTO `astro:assets` optimization by default: stamp the marker the emitter
+  // (`isOptimizedImg` → `<MenoImage>`) and editor toggle read, unless the author already chose
+  // (an explicit `"true"`/`"false"` is left intact — `"false"` is the per-image opt-out). Runs
+  // after legacy `props` fold so a migrated `image` node is covered. Idempotent: a stamped node
+  // re-normalizes to itself. Replace (don't mutate) `attributes` — it is shared with the input.
+  if (
+    out.type === 'node' &&
+    String(out.tag).toLowerCase() === 'img' &&
+    out.attributes &&
+    typeof out.attributes === 'object'
+  ) {
+    const attrs = out.attributes as Record<string, unknown>;
+    if (attrs['data-meno-optimize'] === undefined && isLocalOptimizableSrc(attrs.src)) {
+      out.attributes = { ...attrs, 'data-meno-optimize': 'true' };
+    }
+  }
+
   if (out.type === 'list') {
+    // Legacy list nodes stored the collection name in the deprecated `collection` field
+    // (pre `source`/`sourceType` unification). Promote a STRING `collection` to `source`
+    // when `source` is absent, and infer `sourceType: 'collection'` when it wasn't set —
+    // so the unified emit path resolves it and singularize() never sees an undefined
+    // source ("collection.endsWith" crash). An ARRAY `collection` is the old item-ID list
+    // (different semantics) and is left untouched.
+    if (typeof out.collection === 'string') {
+      if (out.source === undefined || out.source === '') {
+        out.source = out.collection;
+        if (out.sourceType === undefined) out.sourceType = 'collection';
+      }
+      // Legacy collection lists always used `item` as the implicit loop var (the old cms-list
+      // model — see the migration above), and their children/sub-components reference `{{item.*}}`.
+      // The unified model instead defaults the loop var to singularize(source), which both
+      // mismatches those children and can be an invalid JS `.map` arg for a hyphenated collection
+      // (e.g. "case-study" → `.map((case-study) => …)`). So bind the loop to `item` whenever the
+      // deprecated `collection` field marks this as legacy data and no explicit itemAs was set.
+      if (out.itemAs === undefined) out.itemAs = 'item';
+      // Drop the now-redundant deprecated field once `source` carries the value (emit reads
+      // only `source`); keep it only if it disagrees with a pre-existing source (no data loss).
+      if (out.source === out.collection) delete out.collection;
+    }
     const sourceType = (out.sourceType as string) ?? 'prop';
-    // Prop-list source: bare `items` ≡ `{{items}}` (canonical form the editor uses).
-    if (sourceType !== 'collection' && typeof out.source === 'string' && !out.source.includes('{{')) {
+    // Prop-list source: bare `items` ≡ `{{items}}` (canonical form the editor uses). Gated to
+    // 'prop' so a 'remote' list's `url` is never wrapped (remote uses `url`, not `source`).
+    if (sourceType === 'prop' && typeof out.source === 'string' && !out.source.includes('{{')) {
       out.source = `{{${out.source}}}`;
     }
-    // Drop a redundant `itemAs` that equals the implicit default.
+    // Drop a redundant `itemAs` that equals the implicit default (singular collection name for
+    // 'collection'; 'item' for 'prop' and 'remote').
     const defaultItem = sourceType === 'collection' ? singularize(String(out.source)) : 'item';
     if (out.itemAs === defaultItem) delete out.itemAs;
   }
@@ -239,6 +403,18 @@ function normalizeDefineVars(comp: Record<string, unknown>): void {
   }
 }
 
+/**
+ * Canonicalize a verbatim frontmatter passthrough field (`_frontmatter`): trim surrounding
+ * whitespace and drop it when empty, so parse (which always trims) and a hand-written model
+ * agree, and the round-trip stays idempotent.
+ */
+function normalizeFrontmatter(obj: Record<string, unknown>): void {
+  if (!('_frontmatter' in obj)) return;
+  const v = obj._frontmatter;
+  if (typeof v !== 'string' || !v.trim()) delete obj._frontmatter;
+  else obj._frontmatter = v.trim();
+}
+
 export function normalizeModel(model: unknown): unknown {
   if (!model || typeof model !== 'object') return model;
   const m = model as Record<string, unknown>;
@@ -251,12 +427,15 @@ export function normalizeModel(model: unknown): unknown {
     }
     if (comp.structure !== undefined) comp.structure = normalizeNode(comp.structure);
     normalizeDefineVars(comp);
+    normalizeFrontmatter(comp);
     return { ...m, component: comp };
   }
 
-  // Page: { meta?, root?, … }
+  // Page: { meta?, root?, … } — or a raw component definition (handled by emit()'s dispatch);
+  // both carry `_frontmatter`, so canonicalize it here too.
   const out: Record<string, unknown> = { ...m };
   if ('meta' in out && (!out.meta || Object.keys(out.meta as object).length === 0)) delete out.meta;
   if (out.root !== undefined) out.root = normalizeNode(out.root);
+  normalizeFrontmatter(out);
   return out;
 }

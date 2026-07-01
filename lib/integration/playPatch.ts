@@ -28,10 +28,18 @@
  *   5. A component instance's RICH-TEXT prop
  *      changed (markup-bearing string / i18n,
  *      rendered via <Fragment set:html>)      → patch event, kind 'html'.
- *   6. Anything else (structure, object/array
+ *   6. Only a component's own `<style>` block
+ *      (def.css) changed (models otherwise
+ *      deep-equal)                            → patch event, kind 'style'
+ *                                               (the new CSS rides as a payload
+ *                                               sheet — Astro 6 dev renders the
+ *                                               component sheet as an EMPTY
+ *                                               placeholder, so the bridge can't
+ *                                               recover it from the re-fetch).
+ *   7. Anything else (structure, object/array
  *      or {_code}/binding props, conditions,
  *      unparseable, Embed styles)             → stock full reload.
- *   7. `src/styles/theme.css` changed (the
+ *   8. `src/styles/theme.css` changed (the
  *      studio regenerates it on variable/
  *      color saves)                           → patch event, kind 'style'
  *                                               (sheet-swap only — CSS vars
@@ -98,8 +106,8 @@
  *     waits for the next reload, never a wrong patch.
  */
 
-import { readFileSync, existsSync } from 'fs';
-import { join } from 'path';
+import { readFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { parse } from '../dialect';
 import { collectNodeClassTokens, collectModelClassTokens, walkAstroFiles } from './utilityCss';
 import { XRAY_RESOLVER_JS } from './xray';
@@ -131,6 +139,30 @@ export const PLAY_STYLE_PREVIEW_EVENT = 'meno:astro:style-preview';
 export const PLAY_VARS_PREVIEW_EVENT = 'meno:astro:vars-preview';
 
 /**
+ * postMessage type for the optimistic CLASS-RULE preview — the "CSS Classes"
+ * panel editing a mirror-imported class (e.g. `.button { padding: … }`). Payload
+ * `{ className, property, value, state, media }` (property already kebab-cased).
+ * The bridge accumulates declarations into a single managed
+ * `<style id="meno-class-preview">` appended last (so it wins source order over
+ * the mirror `<link>`), repainting instantly. Unlike style/vars-preview it is
+ * STICKY — mirror CSS lives in `public/` with no recompile/HMR, so there is no
+ * "real patch" to clear it; the file write persists the change and a natural
+ * reload loads it with the override gone. Must match the studio's
+ * ASTRO_PLAY_CLASS_PREVIEW_MESSAGE_TYPE literal.
+ */
+export const PLAY_CLASS_PREVIEW_EVENT = 'meno:astro:class-preview';
+
+/**
+ * postMessage type carrying the EXACT structural op (insert/remove/move) the editor
+ * just performed — the editor knows it; the server only emits the `'structure'` patch
+ * SIGNAL. The bridge buffers the op and, on the next `'structure'` patch, applies it
+ * against the re-fetched SSR (so live=pre-op numbering pairs with fetched=post-op).
+ * Payload `{ op: StructureOp }`. Must match the studio's
+ * ASTRO_PLAY_STRUCTURE_OP_MESSAGE_TYPE literal.
+ */
+export const PLAY_STRUCTURE_OP_EVENT = 'meno:astro:structure-op';
+
+/**
  * Opt-in play-patch diagnostics. Off by default; zero cost when off.
  *   - SERVER side (this flag): `MENO_PLAY_DEBUG=1` in the `astro dev` env logs
  *     every reload classification + the cross-env swallow decision to stdout.
@@ -158,7 +190,7 @@ const playDbg = (...args: unknown[]): void => {
  * leaf element (one carrying no stamped descendants — i.e. server-owned markup,
  * not component internals), same structural gate.
  */
-export type PatchKind = 'style' | 'text' | 'attrs' | 'html';
+export type PatchKind = 'style' | 'text' | 'attrs' | 'html' | 'structure';
 
 /**
  * An authoritative stylesheet the server ships INSIDE the patch payload, so the
@@ -194,14 +226,33 @@ const PATCHABLE_NODE_TYPES = new Set(['node', 'link', 'component']);
 export interface EditClassification {
   /** Any difference the patch can't prove safe — the caller must full-reload. */
   structural: boolean;
-  /** Per changed node: the OLD style fields (token retirement is computed from these). */
-  styleDiffs: Array<{ style: unknown; interactiveStyles: unknown; label: string | undefined }>;
+  /**
+   * Per changed node: the OLD style fields (token retirement is computed from these).
+   * `classAttr` is the node's OLD literal `attributes.class` string when a class-string
+   * styling edit rode this diff — its tokens are retired alongside the style() ones.
+   */
+  styleDiffs: Array<{
+    style: unknown;
+    interactiveStyles: unknown;
+    label: string | undefined;
+    classAttr?: string | undefined;
+  }>;
   /** A plain-text child changed somewhere. */
   textChanged: boolean;
   /** A component instance's scalar prop(s) changed (attr/text re-sync, guarded). */
   attrsChanged: boolean;
   /** A component instance's rich-text (markup-string) prop changed (innerHTML re-sync, guarded). */
   htmlChanged: boolean;
+  /** A component's own `<style>` block (def.css) changed (sheet swap via payload). */
+  cssChanged: boolean;
+  /**
+   * A node's ELEMENT children changed by add/remove/reorder of whole safe subtrees
+   * (no in-place content change to survivors, no Embed/island/custom/list/condition/
+   * binding). The bridge applies the editor-supplied op against the re-fetched SSR
+   * instead of reloading. Signals "a safe structural edit happened"; the exact op
+   * arrives from the editor over the structure-op postMessage channel.
+   */
+  treeStructural: boolean;
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -249,6 +300,8 @@ export function classifyModelEdit(oldModel: unknown, newModel: unknown): EditCla
     textChanged: false,
     attrsChanged: false,
     htmlChanged: false,
+    cssChanged: false,
+    treeStructural: false,
   };
   walkPair(oldModel, newModel, out);
   return out;
@@ -272,6 +325,27 @@ function isPatchableI18nValue(v: unknown): boolean {
     if (typeof val !== 'string' || val.includes('<') || val.includes('{{')) return false;
   }
   return true;
+}
+
+/**
+ * A node `children` value that projects to plain text node(s) the bridge re-syncs
+ * via syncText: a markup-free string, a plain-string {@link isPatchableI18nValue
+ * i18n object} (resolves to one locale's string), or an array whose every entry is
+ * one of those. LOCALIZING a plain text node turns its `children` from the string
+ * `"Hello"` into the array `[{ _i18n, en, pl }]`, and a later locale edit diffs two
+ * such arrays — both stay a text patch (and the string⇄[i18n] localize/de-localize
+ * transition too) instead of falling through to a full reload. Markup (`<`), a
+ * `{{binding}}`-carrying i18n value, or any element/child-node entry is NOT
+ * text-projectable → the generic walk classifies it structural. (A bare `{{x}}`
+ * STRING child stays text-projectable for parity with the prior string-only branch.)
+ */
+function isTextProjectableChildren(v: unknown): boolean {
+  if (typeof v === 'string') return !v.includes('<');
+  if (isPatchableI18nValue(v)) return true;
+  if (Array.isArray(v)) {
+    return v.length > 0 && v.every((c) => (typeof c === 'string' ? !c.includes('<') : isPatchableI18nValue(c)));
+  }
+  return false;
 }
 
 /**
@@ -338,6 +412,116 @@ function classifyPropsDiff(oldProps: unknown, newProps: unknown): { attrs: boole
   return { attrs, html };
 }
 
+/**
+ * Two `attributes` objects differ ONLY in their `class` and/or `style` values
+ * (each a plain string or absent) — a class-string / inline-style styling edit the
+ * 'style' patch handles (utility sheet swap + token-granular class merge that
+ * preserves JS-added tokens + property-granular inline style). Any other attribute
+ * change (href, src, id, alt, …) returns false → the generic walk marks it
+ * structural → reload (node attributes are otherwise not patchable).
+ */
+function isClassStyleOnlyAttrDiff(a: unknown, b: unknown): boolean {
+  if (!isPlainObject(a) || !isPlainObject(b)) return false;
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  for (const k of keys) {
+    const av = a[k];
+    const bv = (b as Record<string, unknown>)[k];
+    if (k === 'class' || k === 'style') {
+      if (av !== undefined && typeof av !== 'string') return false;
+      if (bv !== undefined && typeof bv !== 'string') return false;
+      continue;
+    }
+    if (!deepEqual(av, bv)) return false;
+  }
+  return true;
+}
+
+/** Node types whose subtree the bridge can statically place (insert/move/remove) by X-Ray stamp. */
+const TREE_SAFE_TYPES = new Set(['node', 'link', 'component']);
+
+/**
+ * A node whose whole subtree is safe to insert/move/remove as a unit in the play DOM.
+ * Excluded by TYPE only: `embed` (unstamped), `island`/`custom` (opaque foreign markup),
+ * `list`/loop (data-driven count), `slot` — plus any node carrying an `if`/condition
+ * (may not render at all). A `node`/`link`/`component` is otherwise safe REGARDLESS of
+ * its props/attributes: a structural op moves or clones the ALREADY-RENDERED SSR subtree,
+ * so prop/attribute VALUES (arrays like `items={[…]}`, objects, bindings, rich text) are
+ * irrelevant — they'd only matter for an in-place PROP patch, never for insert/move/remove.
+ * (Gating on props was the bug that reloaded every section reorder on real pages whose
+ * sections take array/object props.) Children (slot content) must themselves be safe.
+ */
+function isTreeSafeNode(node: unknown): boolean {
+  if (!isPlainObject(node)) return false;
+  if (typeof node.type !== 'string' || !TREE_SAFE_TYPES.has(node.type)) return false;
+  if ('if' in node || 'condition' in node) return false;
+  const kids = node.children;
+  if (kids == null || typeof kids === 'string' || isPatchableI18nValue(kids)) return true;
+  if (Array.isArray(kids)) {
+    return kids.every((c) => typeof c === 'string' || isPatchableI18nValue(c) || isTreeSafeNode(c));
+  }
+  return false; // unknown children shape ({_code}, list mapping, …)
+}
+
+/** Every entry is a dialect node object (has a string `type`). */
+function isNodeArray(arr: unknown[]): boolean {
+  return arr.length > 0 && arr.every((n) => isPlainObject(n) && typeof n.type === 'string');
+}
+
+/** Multiset equality by deepEqual (used to detect a pure reorder). */
+function isPermutation(a: unknown[], b: unknown[]): boolean {
+  if (a.length !== b.length) return false;
+  const used = new Array(b.length).fill(false);
+  for (const x of a) {
+    let found = false;
+    for (let j = 0; j < b.length; j++) {
+      if (!used[j] && deepEqual(x, b[j])) {
+        used[j] = true;
+        found = true;
+        break;
+      }
+    }
+    if (!found) return false;
+  }
+  return true;
+}
+
+/**
+ * Treat `shorter` as an ordered subsequence of `longer` (by deepEqual) and return
+ * the leftover `longer` entries (the inserted/removed nodes). `null` if `shorter`
+ * is NOT cleanly a subsequence — i.e. a surviving node also changed content, which
+ * is a mixed structural+content edit the single-op bridge can't replay → reload.
+ */
+function orderedSubsequenceExtras(longer: unknown[], shorter: unknown[]): unknown[] | null {
+  const extras: unknown[] = [];
+  let si = 0;
+  for (let li = 0; li < longer.length; li++) {
+    if (si < shorter.length && deepEqual(longer[li], shorter[si])) si++;
+    else extras.push(longer[li]);
+  }
+  return si === shorter.length ? extras : null;
+}
+
+/**
+ * Classify a node's element-children diff:
+ *  - `'tree'`    — a pure add/remove/reorder of whole {@link isTreeSafeNode safe} subtrees
+ *                  (no surviving node changed content) → an editor-driven `'structure'` patch.
+ *  - `'recurse'` — same length, NOT a reorder → in-place content edits at stable positions;
+ *                  let the generic positional walk classify them (style/text/structural).
+ *  - `'unsafe'`  — structural change touching an unsafe node, a mixed structural+content edit,
+ *                  or a non-node array → full reload.
+ */
+function analyzeChildrenStructure(oldKids: unknown[], newKids: unknown[]): 'tree' | 'recurse' | 'unsafe' {
+  if (!isNodeArray(oldKids) || !isNodeArray(newKids)) return 'unsafe';
+  if (oldKids.length === newKids.length) {
+    if (!isPermutation(oldKids, newKids)) return 'recurse'; // in-place edits → generic walk
+    return oldKids.every(isTreeSafeNode) ? 'tree' : 'unsafe'; // pure reorder
+  }
+  const [longer, shorter] = oldKids.length > newKids.length ? [oldKids, newKids] : [newKids, oldKids];
+  const extras = orderedSubsequenceExtras(longer, shorter);
+  if (extras === null) return 'unsafe'; // mixed structural + content change
+  return extras.every(isTreeSafeNode) ? 'tree' : 'unsafe';
+}
+
 function walkPair(a: unknown, b: unknown, out: EditClassification): void {
   if (out.structural || a === b) return;
   if (Array.isArray(a) && Array.isArray(b)) {
@@ -360,6 +544,20 @@ function walkPair(a: unknown, b: unknown, out: EditClassification): void {
         if (!deepEqual(av, bv)) styleDiff = true;
         continue;
       }
+      // A node's `attributes` (class-string styling stores styles as a literal
+      // `attributes.class`; some mirror-imported nodes also carry inline
+      // `attributes.style`). A class/style-only change is a 'style' patch (sheet
+      // swap + class merge); any other attribute change reloads.
+      if (isNode && k === 'attributes') {
+        if (!deepEqual(av, bv)) {
+          if (isClassStyleOnlyAttrDiff(av, bv)) styleDiff = true;
+          else {
+            out.structural = true;
+            return;
+          }
+        }
+        continue;
+      }
       // A component instance's props: scalar (and plain-string i18n) changes
       // re-sync as attrs/text; rich-text (markup string / set:html) changes
       // re-sync as innerHTML; anything else object/array/`{_code}`/binding-shaped
@@ -377,22 +575,56 @@ function walkPair(a: unknown, b: unknown, out: EditClassification): void {
         }
         continue;
       }
-      if (isNode && k === 'children' && typeof av === 'string' && typeof bv === 'string') {
-        if (av !== bv) {
-          // Markup inside a text child renders as ELEMENTS — not expressible
-          // as a text-node patch.
-          if (av.includes('<') || bv.includes('<')) out.structural = true;
-          else out.textChanged = true;
+      // A node's text `children`: a markup-free string, a localized `[{_i18n,…}]`
+      // array, or the string⇄[i18n] localize transition all re-sync as text. A
+      // markup-bearing child (`<`) renders as ELEMENTS — not expressible as a
+      // text-node patch — so it falls through to the generic walk → structural.
+      if (isNode && k === 'children' && isTextProjectableChildren(av) && isTextProjectableChildren(bv)) {
+        if (!deepEqual(av, bv)) out.textChanged = true;
+        continue;
+      }
+      // A node's ELEMENT children changed by add/remove/reorder of whole safe
+      // subtrees → an editor-driven 'structure' patch (the bridge reconciles
+      // against the re-fetched SSR). In-place edits at stable positions fall
+      // through to the generic positional recursion below; an unsafe/ambiguous
+      // structural change reloads. (Pure-text children were handled just above.)
+      if (isNode && k === 'children' && Array.isArray(av) && Array.isArray(bv) && !deepEqual(av, bv)) {
+        const verdict = analyzeChildrenStructure(av, bv);
+        if (verdict === 'tree') {
+          out.treeStructural = true;
+          continue;
         }
+        if (verdict === 'unsafe') {
+          out.structural = true;
+          return;
+        }
+        // 'recurse' → generic positional walk (same length) classifies in-place edits.
+      }
+      // A component definition's own `<style>` block lives in its `css` string
+      // (the file parses to `{ component: { css, structure, … } }`). A css-only
+      // edit re-syncs as a sheet swap, not structure. The `structure`-presence
+      // guard keeps this component-def-specific: a component INSTANCE node has
+      // `type:'component'` (isNode true → handled above), and a page has `root`,
+      // never `css`. A non-string css falls through to the generic walk.
+      if (
+        !isNode &&
+        k === 'css' &&
+        ('structure' in a || 'structure' in (b as Record<string, unknown>)) &&
+        (typeof av === 'string' || av === undefined) &&
+        (typeof bv === 'string' || bv === undefined)
+      ) {
+        if (!deepEqual(av, bv)) out.cssChanged = true;
         continue;
       }
       walkPair(av, bv, out);
     }
     if (styleDiff) {
+      const attrs = a.attributes;
       out.styleDiffs.push({
         style: a.style,
         interactiveStyles: a.interactiveStyles,
         label: typeof a.label === 'string' ? a.label : undefined,
+        classAttr: isPlainObject(attrs) && typeof attrs.class === 'string' ? (attrs.class as string) : undefined,
       });
     }
     return;
@@ -412,7 +644,15 @@ export function classifyAstroEdit(oldSrc: string, newSrc: string): EditClassific
     oldModel = parse(oldSrc).model;
     newModel = parse(newSrc).model;
   } catch {
-    return { structural: true, styleDiffs: [], textChanged: false, attrsChanged: false, htmlChanged: false };
+    return {
+      structural: true,
+      styleDiffs: [],
+      textChanged: false,
+      attrsChanged: false,
+      htmlChanged: false,
+      cssChanged: false,
+      treeStructural: false,
+    };
   }
   return classifyModelEdit(oldModel, newModel);
 }
@@ -562,7 +802,7 @@ export function playPatchVitePlugin(projectRoot: string, utilityCss?: UtilityCss
    * change, or emit-only re-canonicalization) — the caller lets the stock full
    * reload proceed.
    */
-  type EditPlan = { kinds: PatchKind[]; staleTokens: string[] } | 'noop' | 'reload';
+  type EditPlan = { kinds: PatchKind[]; staleTokens: string[]; sheets?: PatchSheet[] } | 'noop' | 'reload';
   const classifyEdit = async (rawFile: string, read: () => Promise<string> | string): Promise<EditPlan> => {
     const file = norm(rawFile);
     // theme.css changes carry CSS variables (the studio regenerates the file on
@@ -592,9 +832,10 @@ export function playPatchVitePlugin(projectRoot: string, utilityCss?: UtilityCss
     }
     // Rungs 2-4: model classification.
     const edit = classifyAstroEdit(prev, source);
-    // A style() or structural change can alter the project class vocabulary the
-    // prop-edit stale tokens are built from — drop the cache so it rebuilds.
-    if (edit.structural || edit.styleDiffs.length > 0) classVocab = null;
+    // A style(), structural, or tree-structural change (inserted nodes may add
+    // classes) can alter the project class vocabulary the prop-edit stale tokens
+    // are built from — drop the cache so it rebuilds.
+    if (edit.structural || edit.styleDiffs.length > 0 || edit.treeStructural) classVocab = null;
     if (edit.structural) {
       playDbg('reload: structural edit (markup/children/non-scalar prop changed)', file);
       return 'reload';
@@ -607,12 +848,38 @@ export function playPatchVitePlugin(projectRoot: string, utilityCss?: UtilityCss
         for (const t of collectNodeClassTokens(d.style, d.interactiveStyles, d.label)) {
           staleTokens.add(t);
         }
+        // Class-string styling: retire the node's OLD literal class tokens so the
+        // client's mergeClasses drops the ones the edit removed (the fresh render
+        // re-adds whatever it still uses; JS-added tokens survive by construction).
+        if (d.classAttr) {
+          for (const t of d.classAttr.split(/\s+/)) if (t) staleTokens.add(t);
+        }
       }
     }
     if (edit.textChanged) kinds.push('text');
     // Rich-text (set:html) prop edits: the bridge replaces the target leaf's
     // innerHTML. No staleTokens / no 'style' ride — content change, not classes.
     if (edit.htmlChanged) kinds.push('html');
+    // A component's own `<style>` block edit: ride kind 'style' (sheet swap) and
+    // ship the new CSS as an authoritative payload sheet. In Astro 6 dev the
+    // component sheet renders as an EMPTY data-vite-dev-id placeholder (Vite injects
+    // it client-side), so the bridge's raw-HTML re-fetch can't recover it — it must
+    // come from the payload, like the utility sheet and theme.css. is:global means no
+    // scope-hash rewrite, so the raw def.css text is selector-faithful (only PostCSS
+    // transforms could drift, self-healing on the next reload). css doesn't touch
+    // utility classes, so classVocab is left intact above.
+    const componentSheets: PatchSheet[] = [];
+    if (edit.cssChanged) {
+      if (!kinds.includes('style')) kinds.push('style');
+      let css = '';
+      try {
+        const comp = (parse(source).model as { component?: { css?: string } }).component;
+        if (comp && typeof comp.css === 'string') css = comp.css;
+      } catch {
+        /* impossible here (classifyAstroEdit already parsed both) — empty self-heals on reload */
+      }
+      componentSheets.push({ match: `src/${file.slice(srcRoot.length)}`, css });
+    }
     if (edit.attrsChanged) {
       kinds.push('attrs');
       // Prop edits ride kind 'style' so the client's mergeClasses retires the
@@ -622,6 +889,14 @@ export function playPatchVitePlugin(projectRoot: string, utilityCss?: UtilityCss
       // superset — mergeClasses re-adds what the fresh render still uses).
       if (!kinds.includes('style')) kinds.push('style');
       for (const t of getClassVocab()) staleTokens.add(t);
+    }
+    // A tree-only structural edit (add/remove/reorder of safe subtrees): emit the
+    // 'structure' signal. The bridge applies the editor-supplied op against the
+    // re-fetched SSR; refreshUtilitySheet also ships the rebuilt utility sheet so
+    // inserted nodes' new utility classes have CSS.
+    if (edit.treeStructural) {
+      playDbg('patch: structure (tree-only add/remove/reorder)', file);
+      kinds.push('structure');
     }
     // Parsed models are fully equal yet the bytes differ — so the only change is
     // emit-only metadata the parser drops (e.g. a structure root's `root: true`,
@@ -633,7 +908,11 @@ export function playPatchVitePlugin(projectRoot: string, utilityCss?: UtilityCss
       playDbg('reload: emit-only re-canonicalization (model unchanged, bytes differ)', file);
       return 'reload';
     }
-    return { kinds, staleTokens: [...staleTokens] };
+    return {
+      kinds,
+      staleTokens: [...staleTokens],
+      ...(componentSheets.length ? { sheets: componentSheets } : {}),
+    };
   };
 
   /**
@@ -656,7 +935,12 @@ export function playPatchVitePlugin(projectRoot: string, utilityCss?: UtilityCss
     read: () => Promise<string> | string,
     server: InvalidatableServer,
   ): Promise<PatchSheet[] | undefined> => {
-    if (!utilityCss || plan === 'noop') return undefined;
+    // A component `<style>` edit ships its CSS as a payload sheet (computed in
+    // classifyEdit, where the parsed source is in hand). Carry it through alongside
+    // the rebuilt utility sheet — even when there's no utilityCss controller (unit
+    // tests / non-play callers), the component sheet must still reach the bridge.
+    const extra = typeof plan === 'object' && Array.isArray(plan.sheets) ? plan.sheets : [];
+    if (!utilityCss || plan === 'noop') return extra.length ? extra : undefined;
     const n = norm(file);
     if (n === themeCssPath) {
       let css = '';
@@ -665,13 +949,17 @@ export function playPatchVitePlugin(projectRoot: string, utilityCss?: UtilityCss
       } catch {
         /* unreadable → empty sheet (the next reload re-renders it) */
       }
-      return [{ match: 'styles/theme.css', css }];
+      return [{ match: 'styles/theme.css', css }, ...extra];
     }
-    if (!n.endsWith('.astro') || !n.startsWith(srcRoot)) return undefined;
+    if (!n.endsWith('.astro') || !n.startsWith(srcRoot)) return extra.length ? extra : undefined;
     const css = utilityCss.rebuild();
     utilityCss.invalidate(server);
-    if (plan === 'reload' || !plan.kinds.includes('style')) return undefined;
-    return [{ match: 'meno-utilities', css }];
+    // A 'structure' patch needs the rebuilt utility sheet too (inserted nodes may
+    // carry brand-new utility classes whose CSS the bridge can't recover by re-fetch).
+    if (plan === 'reload' || !(plan.kinds.includes('style') || plan.kinds.includes('structure'))) {
+      return extra.length ? extra : undefined;
+    }
+    return [{ match: 'meno-utilities', css }, ...extra];
   };
 
   return {
@@ -1021,6 +1309,74 @@ export const PATCH_JS = `
       renderVarsTag();
     }
 
+    // ---- optimistic CLASS-RULE preview (mirror "CSS Classes" panel) ----------
+    // Editing a mirror-imported class (.button { padding: … }) writes the CSS
+    // file, but public/ has no recompile/HMR — so without this the change shows
+    // only after a manual reload. The editor posts the changed declaration
+    // { className, property (kebab), value, state, media }; we accumulate per
+    // (media|state|className → property) so several edits stack, and render one
+    // managed <style id="meno-class-preview"> appended LAST (wins source order
+    // over the mirror <link>). STICKY: there is no real patch to clear it (unlike
+    // style/vars preview); the persisted file is loaded fresh — override gone —
+    // on the next natural reload. The .class selector mirrors the file edit
+    // exactly, so the cascade (e.g. a more-specific .button.cc-jumbo still
+    // winning) behaves identically to a real save.
+    var optimisticClasses = {};
+    var optimisticClassesTag = null;
+    function renderClassesTag() {
+      // Group accumulated declarations by (media|selector) → "prop: val;" list.
+      var byKey = {};
+      var meta = {};
+      var any = false;
+      for (var k in optimisticClasses) {
+        var e = optimisticClasses[k];
+        any = true;
+        var gk = e.media + '||' + e.selector;
+        (byKey[gk] = byKey[gk] || []).push(e.property + ': ' + e.value + ';');
+        meta[gk] = { media: e.media, selector: e.selector };
+      }
+      if (!any) {
+        if (optimisticClassesTag && optimisticClassesTag.parentNode) {
+          optimisticClassesTag.parentNode.removeChild(optimisticClassesTag);
+        }
+        optimisticClassesTag = null;
+        return;
+      }
+      var css = '';
+      for (var gk2 in byKey) {
+        var rule = meta[gk2].selector + ' { ' + byKey[gk2].join(' ') + ' }';
+        css += meta[gk2].media ? '@media ' + meta[gk2].media + ' { ' + rule + ' } ' : rule + ' ';
+      }
+      if (!optimisticClassesTag) {
+        optimisticClassesTag = document.createElement('style');
+        optimisticClassesTag.id = 'meno-class-preview';
+        document.head.appendChild(optimisticClassesTag);
+      } else if (optimisticClassesTag.parentNode !== document.head) {
+        // Keep it LAST so it wins source order even after head mutations.
+        document.head.appendChild(optimisticClassesTag);
+      }
+      optimisticClassesTag.textContent = css;
+    }
+    function applyClassPreview(className, property, value, state, media, kind) {
+      // Injection guards (textContent CSS, same rigor as applyVarsPreview): a bare
+      // class/tag token, a kebab property (optional leading -- for custom props), a
+      // value/state/media free of CSS-breakout chars.
+      if (typeof className !== 'string' || !/^[A-Za-z0-9_-]+$/.test(className)) return;
+      if (typeof property !== 'string' || !/^(?:--)?[A-Za-z][A-Za-z0-9-]*$/.test(property)) return;
+      if (typeof value !== 'string' || value === '' || /[{}<>;]/.test(value)) return;
+      var st = typeof state === 'string' && /^:[a-z-]+$/.test(state) ? state : '';
+      var m = typeof media === 'string' && !/[{}<>;]/.test(media) ? media : '';
+      // kind 'tag' targets a bare element selector (h1, a); anything else a .class.
+      var selector = (kind === 'tag' ? '' : '.') + className + st;
+      optimisticClasses[m + '|' + selector + '|' + property] = {
+        media: m,
+        selector: selector,
+        property: property,
+        value: value,
+      };
+      renderClassesTag();
+    }
+
     // Direct child text nodes only, and only when the counts match — a
     // mismatch means the structures diverged (JS inserted something); skipping
     // is always safe, the next reload reconciles.
@@ -1110,8 +1466,149 @@ export const PATCH_JS = `
       return false;
     }
 
+    // ---- structural reconcile (editor-driven op) ------------------------------
+    // The server emits a 'structure' patch SIGNAL; the editor posts the exact op
+    // (insert/remove/move). We apply ONE op against the re-fetched SSR — live is in
+    // PRE-op numbering, fetched in POST-op numbering, so anchors/targets resolve in
+    // the LIVE doc and the inserted node resolves in the FETCHED doc. After the
+    // mutation the live structure matches fetched, so we re-stamp from fetched
+    // (positional X-Ray paths renumber on insert/remove) to keep later in-place
+    // patches pairing. Every uncertainty throws → the bridge's .catch reloads.
+
+    // Copy the X-Ray identity stamps fetched -> live (positional path, instance, slot).
+    function copyStamp(liveEl, nextEl) {
+      var attrs = ['data-element-path', 'data-meno-instance', 'data-meno-slot'];
+      for (var i = 0; i < attrs.length; i++) {
+        var v = nextEl.getAttribute(attrs[i]);
+        if (v === null) liveEl.removeAttribute(attrs[i]);
+        else liveEl.setAttribute(attrs[i], v);
+      }
+    }
+
+    // After a structural mutation the live + fetched stamped trees match in document
+    // order EXCEPT for live-only JS clones (loop carousels / marquees duplicate stamped
+    // SSR nodes — ubiquitous on real sites). Copy fresh stamps over with a two-pointer
+    // that SKIPS a live element with no fetched counterpart (tag mismatch = a clone), so
+    // renumbered survivors carry their NEW paths and clones are simply left alone (their
+    // stale stamp self-heals on the next reload — the same tolerance collectPairs/
+    // structureDiverged already grant). Only a SHORTFALL — live can't cover every fetched
+    // element — is a real divergence → throw → reload.
+    function reStampAll(nextDoc) {
+      var liveEls = document.querySelectorAll('[data-element-path]');
+      var nextEls = nextDoc.querySelectorAll('[data-element-path]');
+      var li = 0;
+      var ni = 0;
+      while (li < liveEls.length && ni < nextEls.length) {
+        if (liveEls[li].tagName === nextEls[ni].tagName) {
+          copyStamp(liveEls[li], nextEls[ni]);
+          li++;
+          ni++;
+        } else {
+          li++; // live-only JS clone — skip it, keep its stale stamp
+        }
+      }
+      if (ni < nextEls.length) {
+        // Ran out of live before covering all fetched → the op did NOT reproduce the
+        // server's structure (a hidden conditional/list fired, or a wrong anchor).
+        throw new Error('meno-play: re-stamp shortfall (' + ni + '/' + nextEls.length + ')');
+      }
+    }
+
+    // Re-run the <script>s inside a freshly INSERTED subtree (DOMParser/clone scripts
+    // are inert). Safe: the subtree is NEW, so a scriptBind IIFE binds for the first
+    // time (no double-bind). previousElementSibling is preserved by replaceChild.
+    function runScripts(root) {
+      var olds = root.querySelectorAll ? root.querySelectorAll('script') : [];
+      for (var i = 0; i < olds.length; i++) {
+        var old = olds[i];
+        var s = document.createElement('script');
+        for (var a = 0; a < old.attributes.length; a++) s.setAttribute(old.attributes[a].name, old.attributes[a].value);
+        s.textContent = old.textContent;
+        if (old.parentNode) old.parentNode.replaceChild(s, old);
+      }
+    }
+
+    // Resolve an op anchor in the LIVE doc → { mode, ref }. parentEl is needed only
+    // for 'firstChild'. Throws (→ reload) if a referenced sibling can't be located.
+    function resolveAnchor(anchor, parentEl) {
+      if (anchor && anchor.firstChild) {
+        if (!parentEl) throw new Error('meno-play: firstChild anchor without a parent');
+        return { mode: 'firstChild', parent: parentEl };
+      }
+      if (anchor && anchor.after) {
+        var aft = resolveTarget(anchor.after);
+        if (!aft) throw new Error('meno-play: anchor.after not found');
+        return { mode: 'after', ref: aft };
+      }
+      if (anchor && anchor.before) {
+        var bef = resolveTarget(anchor.before);
+        if (!bef) throw new Error('meno-play: anchor.before not found');
+        return { mode: 'before', ref: bef };
+      }
+      throw new Error('meno-play: malformed anchor');
+    }
+
+    function placeByAnchor(el, anchor) {
+      if (anchor.mode === 'firstChild') anchor.parent.insertBefore(el, anchor.parent.firstChild);
+      else if (anchor.mode === 'after') anchor.ref.parentNode.insertBefore(el, anchor.ref.nextSibling);
+      else anchor.ref.parentNode.insertBefore(el, anchor.ref); // 'before'
+    }
+
+    // Apply the structural change directly. We deliberately do NOT wrap it in
+    // document.startViewTransition: with no element assigned a view-transition-name,
+    // the browser runs its default *root* snapshot transition, which cross-fades the
+    // WHOLE page on every move/insert/remove — distracting and easily mistaken for a
+    // full reload. A synchronous throw here propagates out of applyPatch to the
+    // bridge's .catch(location.reload), so a failed mutation still reloads — never a
+    // half-applied page.
+    function runStructureMutation(mutate) {
+      mutate();
+    }
+
+    // Resolve + plan the op (NO global stamped-count check: JS clones on real pages
+    // inflate the live count vs the SSR fetch, which would bail EVERY structural edit
+    // to a reload). Validation is resolve-success here + the re-stamp shortfall guard
+    // after the mutation — both throw → reload, never a half-applied page.
+    function applyStructureOp(nextDoc, op) {
+      if (!op || !op.kind) throw new Error('meno-play: malformed structure op');
+      var mutate;
+      if (op.kind === 'remove') {
+        var rmEl = resolveTarget(op.target);
+        if (!rmEl) throw new Error('meno-play: remove target not found');
+        mutate = function () {
+          if (rmEl.parentNode) rmEl.parentNode.removeChild(rmEl);
+        };
+      } else if (op.kind === 'insert') {
+        var nEl = resolveTarget(op.newNode, nextDoc);
+        if (!nEl) throw new Error('meno-play: inserted node not found in fetched doc');
+        var clone = nEl.cloneNode(true);
+        var iParent = op.parent ? resolveTarget(op.parent) : null;
+        var iAnchor = resolveAnchor(op.anchor, iParent);
+        mutate = function () {
+          placeByAnchor(clone, iAnchor);
+          runScripts(clone);
+        };
+      } else if (op.kind === 'move') {
+        var mvEl = resolveTarget(op.from);
+        if (!mvEl) throw new Error('meno-play: move source not found');
+        var mParent = op.toParent ? resolveTarget(op.toParent) : null;
+        var mAnchor = resolveAnchor(op.anchor, mParent);
+        // Re-insert the LIVE element (keeps its bound listeners / JS state); never
+        // re-extract from fetched and never re-run its script.
+        mutate = function () {
+          placeByAnchor(mvEl, mAnchor);
+        };
+      } else {
+        throw new Error('meno-play: unsupported structure op ' + op.kind);
+      }
+      runStructureMutation(function () {
+        mutate();
+        reStampAll(nextDoc);
+      });
+    }
+
     // ---- entry point ----------------------------------------------------------
-    function applyPatch(nextDoc, kinds, staleTokens, sheets) {
+    function applyPatch(nextDoc, kinds, staleTokens, sheets, op) {
       // Clear optimistic inline previews FIRST: this patch carries the server's
       // authoritative styling (rebuilt utility sheet + define:vars inline), and
       // a lingering optimistic inline (specificity 1,0,0,0) would shadow it and
@@ -1125,13 +1622,33 @@ export const PATCH_JS = `
         else o.el.setAttribute('style', o.original);
       }
       optimistic = [];
-      // Drop the optimistic variable override too — applyPayloadSheets below swaps
-      // in the regenerated theme.css with the real custom-property values.
-      clearVarsPreview();
+      // Drop the optimistic variable override ONLY when this patch carries the regenerated
+      // theme.css — that's the patch (a design-token / theme.css edit) whose applyPayloadSheets
+      // below swaps in the authoritative custom-property values. Clearing it on ANY OTHER style
+      // patch (an .astro element edit ships only the utility sheet, never theme.css) would strand
+      // a just-previewed variable on the STALE on-disk theme.css value: e.g. editing font-weight
+      // on <Text> reverts its font-size, which is driven entirely by var(--t-fs) — while <Heading>
+      // (literal font-size fallback) is immune. The override holds the correct edited value until
+      // its own theme.css patch replaces it.
+      var hasThemeSheet = !!(sheets && sheets.some(function (s) { return s && (s.match || '').indexOf('theme.css') !== -1; }));
+      if (hasThemeSheet) clearVarsPreview();
       var doStyle = kinds.indexOf('style') !== -1;
       var doText = kinds.indexOf('text') !== -1;
       var doAttrs = kinds.indexOf('attrs') !== -1;
       var doHtml = kinds.indexOf('html') !== -1;
+      var doStructure = kinds.indexOf('structure') !== -1;
+      // Structure patches are atomic (one editor op per save): apply the rebuilt
+      // utility sheet (inserted nodes' new classes) + the op, then return. Survivors
+      // are unchanged (no per-pair work) and the inserted node is cloned from the
+      // fresh SSR with its correct classes. A missing op (lost/coalesced message)
+      // throws → reload.
+      if (doStructure) {
+        if (!op) throw new Error('meno-play: structure patch without an op');
+        syncSheets(nextDoc);
+        applyPayloadSheets(sheets);
+        applyStructureOp(nextDoc, op);
+        return;
+      }
       if (doStyle) {
         // syncSheets first (component sheets, etc.), then the authoritative utility
         // sheet + theme.css from the payload — payload wins over an empty/stale
@@ -1190,6 +1707,29 @@ ${PATCH_JS}
     var pendingKinds = {};
     var pendingStale = {};
     var pendingSheets = {};
+    // Buffered editor-supplied structural ops (insert/remove/move), correlated to
+    // the server's 'structure' patch SIGNAL. TTL guards a lost/late message.
+    var opQueue = [];
+    // Generous TTL: on a heavy project the save → astro rebuild → 'structure' patch can
+    // take a few seconds; the buffered op must survive that. A stale op (its patch never
+    // came, i.e. the edit actually reloaded) is cleared by that reload re-initing the
+    // bridge, so a long TTL can't mis-apply across reloads.
+    var OP_TTL = 8000;
+
+    // Pop the single structural op for a 'structure' patch. Exactly-one is the
+    // formal guarantee that live (pre-op numbering) pairs with fetched (post-single-
+    // op): 0 = lost/late message, >1 = rapid-edit coalescing (only the FINAL SSR is
+    // fetchable, so intermediate ops can't be replayed). Either → throw → reload.
+    function takeStructureOp() {
+      var now = (typeof Date !== 'undefined' && Date.now) ? Date.now() : 0;
+      var fresh = [];
+      for (var i = 0; i < opQueue.length; i++) {
+        if (now - opQueue[i].ts < OP_TTL) fresh.push(opQueue[i]);
+      }
+      opQueue = [];
+      if (fresh.length !== 1) throw new Error('meno-play: structure op count ' + fresh.length + ' (need exactly 1)');
+      return fresh[0].op;
+    }
 
     // Opt-in diagnostics — flip WITHOUT any server/app change: in the preview
     // devtools run localStorage['meno:play:debug'] = '1' (or set
@@ -1230,7 +1770,10 @@ ${PATCH_JS}
           return res.text();
         })
         .then(function (html) {
-          applyPatch(new DOMParser().parseFromString(html, 'text/html'), batch.kinds, batch.stale, batch.sheets);
+          var nextDoc = new DOMParser().parseFromString(html, 'text/html');
+          // A 'structure' patch needs the editor's exact op (exactly one buffered).
+          var op = batch.kinds.indexOf('structure') !== -1 ? takeStructureOp() : null;
+          applyPatch(nextDoc, batch.kinds, batch.stale, batch.sheets, op);
           inflight = false;
           if (queued) { queued = false; refresh(); }
         })
@@ -1291,6 +1834,56 @@ ${PATCH_JS}
       if (!d.vars || typeof d.vars !== 'object') return;
       applyVarsPreview(d.vars, typeof d.media === 'string' ? d.media : '');
     });
+
+    // Optimistic class-rule preview (window.postMessage, any origin — same
+    // rationale as above; applyClassPreview validates the class/property/value so
+    // a managed <style> override can't inject arbitrary CSS or break out).
+    window.addEventListener('message', function (ev) {
+      var d = ev && ev.data;
+      if (!d || d.type !== '${PLAY_CLASS_PREVIEW_EVENT}') return;
+      applyClassPreview(d.className, d.property, d.value, d.state, d.media, d.kind);
+    });
+
+    // Editor-supplied structural op (insert/remove/move) from the studio (any
+    // origin — same rationale as the previews above; resolveTarget further validates
+    // each id's path/chain before any DOM change, and takeStructureOp requires
+    // exactly one buffered op per 'structure' patch). Buffered until the server's
+    // 'structure' patch signal lands.
+    window.addEventListener('message', function (ev) {
+      var d = ev && ev.data;
+      if (!d || d.type !== '${PLAY_STRUCTURE_OP_EVENT}') return;
+      var op = d.op;
+      if (!op || (op.kind !== 'insert' && op.kind !== 'remove' && op.kind !== 'move')) return;
+      var now = (typeof Date !== 'undefined' && Date.now) ? Date.now() : 0;
+      opQueue.push({ op: op, ts: now });
+    });
+
+    // Preserve scroll position across the full reloads that still happen (script /
+    // Embed / structural edits, and the bridge's own .catch(location.reload)). The
+    // iframe scrolls natively in play mode, so without this it snaps to the top on
+    // every reload — which reads as the whole project reloading. Save on pagehide,
+    // restore on the next load when the URL still matches (then clear, so a real
+    // navigation never restores a stale offset), re-asserting a few times to win
+    // against late JS/layout shift.
+    try {
+      var SCROLL_KEY = 'meno:play:scroll';
+      window.addEventListener('pagehide', function () {
+        try {
+          sessionStorage.setItem(SCROLL_KEY, JSON.stringify({ u: location.href, x: window.scrollX, y: window.scrollY }));
+        } catch (e) {}
+      });
+      var savedScroll = null;
+      try { savedScroll = JSON.parse(sessionStorage.getItem(SCROLL_KEY) || 'null'); } catch (e) {}
+      if (savedScroll && savedScroll.u === location.href) {
+        try { sessionStorage.removeItem(SCROLL_KEY); } catch (e) {}
+        var restoreScroll = function () { try { window.scrollTo(savedScroll.x, savedScroll.y); } catch (e) {} };
+        if (document.readyState === 'complete') restoreScroll();
+        else window.addEventListener('load', restoreScroll);
+        setTimeout(restoreScroll, 0);
+        setTimeout(restoreScroll, 100);
+        setTimeout(restoreScroll, 300);
+      }
+    } catch (e) {}
 
     // import.meta.hot is module-graph-only and a raw vite-hmr WebSocket is
     // token-gated in Vite 6+ — createHotContext on Vite's own client is the

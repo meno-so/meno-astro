@@ -9,16 +9,32 @@
  * rich-text parity). When a wrapper is needed (a `class` or extra attributes were
  * supplied) we wrap in a `<div>` carrying them; otherwise we emit the HTML bare via a
  * `<Fragment>` so no extra element is introduced.
+ *
+ * The wrapper `<div>` carries the `oem` reset class — the dialect twin of meno-core SSR's
+ * `.oem` embed wrapper (`line-height: 0` etc., defined in BaseLayout's BASE_RESET_CSS). Without
+ * it an inline-SVG/icon embed keeps its baseline descender gap and floats UP inside a
+ * flex-centered box (e.g. a `<button>` carousel arrow centered in meno-core but not in Astro).
+ * The `.oem > *` rule restores a normal line-height so block rich-text inside a styled embed
+ * still lays out correctly. The bare (`<Fragment>`) branch stays unwrapped, so embeds with no
+ * class/attrs (typically block rich-text) are unaffected — matching the prior behavior.
  */
-import { richText } from 'meno-astro';
+import { richText, richTextWithComponents } from 'meno-astro';
 
 interface Props {
   html?: unknown; // HTML string, a TipTap doc, or a { __richtext__, … } marker
   class?: string;
+  // The project component registry (`src/cmsComponents.ts`), passed by the emitter ONLY when this
+  // Embed binds a CMS rich-text field — so components embedded in that field render. Never a real
+  // DOM attribute: destructured out (below) so it can't leak onto the wrapper `<div>`.
+  components?: Record<string, unknown>;
   [attr: string]: unknown;
 }
 
-const { html: rawHtml = '', class: className, ...rest } = Astro.props;
+const { html: rawHtml = '', class: className, components, ...rest } = Astro.props;
+
+// `oem` reset class first, then the author's class(es) — see the header note. `@layer base`
+// keeps `.oem` below the author's (unlayered) utility classes, so an explicit style still wins.
+const wrapperClass = ['oem', className].filter(Boolean).join(' ');
 
 // CMS rich-text fields are stored as TipTap JSON, so `<Embed html={cms.content}>`
 // receives an OBJECT on real items — without normalizing it, Astro's `set:html`
@@ -26,11 +42,17 @@ const { html: rawHtml = '', class: className, ...rest } = Astro.props;
 // (resolve i18n wrapper → TipTap/marker → HTML → localize internal links); idempotent
 // on plain HTML strings, and handles a multi-locale `{ _i18n, en, pl }` value even when
 // the template binds `html={cms.content}` without an explicit `i18n()`.
-const html = richText(rawHtml);
+//
+// When the emitter supplies the component registry (a CMS rich-text field bound here can carry
+// `menoComponent` nodes), render those embedded project components for real via
+// `richTextWithComponents` — the same registry-backed pass the text-child / rich-text-prop paths
+// use; without it they leak as empty `<div data-meno-component>` markers. It returns a Promise,
+// which `set:html` awaits natively. Verbatim/URL embeds (no registry) keep the lighter pipeline.
+const html = components ? richTextWithComponents(rawHtml, components) : richText(rawHtml);
 const hasWrapperAttrs = Boolean(className) || Object.keys(rest).length > 0;
 ---
 {hasWrapperAttrs ? (
-  <div class={className} {...rest} set:html={html} />
+  <div class={wrapperClass} {...rest} set:html={html} />
 ) : (
   <Fragment set:html={html} />
 )}

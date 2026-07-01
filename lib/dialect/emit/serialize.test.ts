@@ -112,7 +112,7 @@ describe('serializeLiteral — multi-line expansion', () => {
       { indent: 4, width: 20 },
     );
     // Each property indented to baseIndent+2 = 6 spaces; closing brace at baseIndent = 4.
-    expect(out.split('\n')[1].startsWith('      a: ')).toBe(true);
+    expect(out.split('\n')[1]!.startsWith('      a: ')).toBe(true);
     expect(out.split('\n').at(-1)).toBe('    }');
   });
 });

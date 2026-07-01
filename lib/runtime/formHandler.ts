@@ -25,7 +25,23 @@ export const formHandlerScript = `
   var forms = document.querySelectorAll('form[data-submit-handler="fetch"]');
   if (!forms.length) return;
 
+  // Spam protection (server-enforced at /api/send-email): inject a hidden honeypot
+  // field bots fill but humans never see, and stamp a clock-skew-free dwell time on
+  // submit. Fields named with a leading "_" are control/meta and are not emailed.
+  var loadedAt = Date.now();
+
   forms.forEach(function (form) {
+    if (!form.querySelector('input[name="_honey"]')) {
+      var hp = document.createElement('input');
+      hp.type = 'text';
+      hp.name = '_honey';
+      hp.tabIndex = -1;
+      hp.setAttribute('autocomplete', 'off');
+      hp.setAttribute('aria-hidden', 'true');
+      hp.style.cssText = 'position:absolute;left:-9999px;width:1px;height:1px;opacity:0';
+      form.appendChild(hp);
+    }
+
     form.addEventListener('submit', async function (e) {
       e.preventDefault();
 
@@ -60,7 +76,9 @@ export const formHandlerScript = `
       }
 
       try {
-        var response = await fetch(action, { method: method.toUpperCase(), body: new FormData(form) });
+        var body = new FormData(form);
+        body.append('_elapsed', String(Date.now() - loadedAt));
+        var response = await fetch(action, { method: method.toUpperCase(), body: body });
         var data = await response.json().catch(function () { return {}; });
         if (response.ok && data.success) {
           showMessage(data.message || successMessage, true);

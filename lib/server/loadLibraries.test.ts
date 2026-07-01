@@ -1,7 +1,7 @@
 import { test, expect, describe, afterEach } from 'bun:test';
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync, utimesSync } from 'fs';
-import { tmpdir } from 'os';
-import { join } from 'path';
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, utimesSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { loadLibraries, collectAstroComponentLibraries } from './loadLibraries';
 
 const tmps: string[] = [];
@@ -42,15 +42,39 @@ describe('loadLibraries', () => {
     expect(loadLibraries(root).headCSS).toContain('media="print"');
   });
 
-  test('external JS default position -> bodyEndJS (deferred); position:head -> headJS', () => {
+  test('default classic JS -> BLOCKING <head> script (load-order fix); explicit position:head still deferred', () => {
+    // A default classic library (no mode/position) is the auto-provisioned UMD-global case
+    // (embla, swiper, …) — it must define its global before the inline component init scripts
+    // emitted mid-body run, so it renders as a blocking <head> script (no defer). An author who
+    // explicitly set position:head kept their deferred head script (intent honored).
     const root = projectWith({
       libraries: {
         js: [{ url: 'https://cdn/body.js' }, { url: 'https://cdn/head.js', position: 'head' }],
       },
     });
     const { headJS, bodyEndJS } = loadLibraries(root);
-    expect(bodyEndJS).toBe('<script src="https://cdn/body.js" defer></script>');
-    expect(headJS).toBe('<script src="https://cdn/head.js" defer></script>');
+    expect(bodyEndJS).toBe('');
+    expect(headJS).toBe(
+      '<script src="https://cdn/body.js"></script>\n  <script src="https://cdn/head.js" defer></script>',
+    );
+  });
+
+  test('an EXPLICIT mode/position on a classic script is honored (not force-blocked into <head>)', () => {
+    // Only DEFAULT classic scripts move to a blocking <head> tag. An author who explicitly
+    // opted into defer (or body-end) keeps that load strategy — we never override intent.
+    const root = projectWith({
+      libraries: {
+        js: [
+          { url: 'https://cdn/explicit-defer.js', mode: 'defer' },
+          { url: 'https://cdn/explicit-body.js', position: 'body-end' },
+        ],
+      },
+    });
+    const { headJS, bodyEndJS } = loadLibraries(root);
+    expect(headJS).toBe('');
+    expect(bodyEndJS).toBe(
+      '<script src="https://cdn/explicit-defer.js" defer></script>\n  <script src="https://cdn/explicit-body.js" defer></script>',
+    );
   });
 
   test('module type and async mode render on the <script>', () => {
@@ -71,9 +95,9 @@ describe('loadLibraries', () => {
     const root = projectWith({
       libraries: { css: ['https://cdn/s.css'], js: ['https://cdn/s.js'] },
     });
-    const { headCSS, bodyEndJS } = loadLibraries(root);
+    const { headCSS, headJS } = loadLibraries(root);
     expect(headCSS).toContain('href="https://cdn/s.css"');
-    expect(bodyEndJS).toContain('src="https://cdn/s.js"');
+    expect(headJS).toContain('src="https://cdn/s.js"');
   });
 
   test('local CSS is inlined into a <style> tag (byte-parity with SSR)', () => {
@@ -101,8 +125,8 @@ describe('loadLibraries', () => {
       libraries: { js: [{ url: 'https://cdn/g.js' }, { url: 'https://cdn/dup.js' }] },
       __componentLibraries: { js: [{ url: 'https://cdn/c.js' }, { url: 'https://cdn/dup.js' }] },
     });
-    const { bodyEndJS } = loadLibraries(root, { libraries: { js: [{ url: 'https://cdn/p.js' }] } });
-    const urls = [...bodyEndJS.matchAll(/src="([^"]+)"/g)].map((m) => m[1]);
+    const { headJS } = loadLibraries(root, { libraries: { js: [{ url: 'https://cdn/p.js' }] } });
+    const urls = [...headJS.matchAll(/src="([^"]+)"/g)].map((m) => m[1]);
     expect(urls).toEqual(['https://cdn/g.js', 'https://cdn/dup.js', 'https://cdn/c.js', 'https://cdn/p.js']);
   });
 
@@ -111,10 +135,10 @@ describe('loadLibraries', () => {
       libraries: { js: [{ url: 'https://cdn/g.js' }] },
       __componentLibraries: { js: [{ url: 'https://cdn/c.js' }] },
     });
-    const { bodyEndJS } = loadLibraries(root, {
+    const { headJS } = loadLibraries(root, {
       libraries: { mode: 'replace', js: [{ url: 'https://cdn/only.js' }] },
     });
-    expect(bodyEndJS).toBe('<script src="https://cdn/only.js" defer></script>');
+    expect(headJS).toBe('<script src="https://cdn/only.js"></script>');
   });
 
   test('page-tier local CSS is NOT rendered as a tag (it loads via the page import)', () => {
@@ -125,15 +149,15 @@ describe('loadLibraries', () => {
 
   test('page-tier local module JS is dropped (imported), but local CLASSIC JS stays a tag', () => {
     const root = projectWith({});
-    const { bodyEndJS } = loadLibraries(root, {
+    const { headJS } = loadLibraries(root, {
       libraries: {
         js: [
           { url: '/libraries/mod.js', type: 'module' }, // imported by the page → no tag
-          { url: '/libraries/legacy.js' }, // classic → still a <script src> tag
+          { url: '/libraries/legacy.js' }, // classic → blocking <head> script (load-order fix)
         ],
       },
     });
-    expect(bodyEndJS).toBe('<script src="/libraries/legacy.js" defer></script>');
+    expect(headJS).toBe('<script src="/libraries/legacy.js"></script>');
   });
 
   test('global-tier local CSS is still inlined (no per-page import exists for it)', () => {
@@ -180,7 +204,7 @@ describe('component tier — live collection from src/components (play-mode pari
   test('external JS in a component __meno is injected with NO __componentLibraries snapshot', () => {
     const root = projectWith({});
     writeComponent(root, 'Slider.astro', `{ js: [{ url: "https://cdn/swiper.js" }] }`);
-    expect(loadLibraries(root).bodyEndJS).toBe('<script src="https://cdn/swiper.js" defer></script>');
+    expect(loadLibraries(root).headJS).toBe('<script src="https://cdn/swiper.js"></script>');
   });
 
   test('live collection supersedes a STALE __componentLibraries snapshot', () => {
@@ -188,16 +212,16 @@ describe('component tier — live collection from src/components (play-mode pari
       __componentLibraries: { js: [{ url: 'https://cdn/removed-long-ago.js' }] },
     });
     writeComponent(root, 'Slider.astro', `{ js: [{ url: "https://cdn/current.js" }] }`);
-    const { bodyEndJS } = loadLibraries(root);
-    expect(bodyEndJS).toBe('<script src="https://cdn/current.js" defer></script>');
-    expect(bodyEndJS).not.toContain('removed-long-ago');
+    const { headJS } = loadLibraries(root);
+    expect(headJS).toBe('<script src="https://cdn/current.js"></script>');
+    expect(headJS).not.toContain('removed-long-ago');
   });
 
   test('snapshot is still the fallback when the project has no src/components dir', () => {
     const root = projectWith({
       __componentLibraries: { js: [{ url: 'https://cdn/snapshot.js' }] },
     });
-    expect(loadLibraries(root).bodyEndJS).toContain('https://cdn/snapshot.js');
+    expect(loadLibraries(root).headJS).toContain('https://cdn/snapshot.js');
   });
 
   test('component local CSS + module JS are stripped (they load via the component import); classic local JS stays', () => {
@@ -207,16 +231,16 @@ describe('component tier — live collection from src/components (play-mode pari
       'Card.astro',
       `{ css: [{ url: "/libraries/card.css" }], js: [{ url: "/libraries/card.js", type: "module" }, { url: "/libraries/legacy.js" }] }`,
     );
-    const { headCSS, bodyEndJS } = loadLibraries(root);
+    const { headCSS, headJS } = loadLibraries(root);
     expect(headCSS).toBe('');
-    expect(bodyEndJS).toBe('<script src="/libraries/legacy.js" defer></script>');
+    expect(headJS).toBe('<script src="/libraries/legacy.js"></script>');
   });
 
   test('walks category subfolders and dedupes by URL across components and vs global', () => {
     const root = projectWith({ libraries: { js: [{ url: 'https://cdn/shared.js' }] } });
     writeComponent(root, 'A.astro', `{ js: [{ url: "https://cdn/shared.js" }, { url: "https://cdn/a.js" }] }`);
     writeComponent(root, join('ui', 'B.astro'), `{ js: [{ url: "https://cdn/a.js" }, { url: "https://cdn/b.js" }] }`);
-    const urls = [...loadLibraries(root).bodyEndJS.matchAll(/src="([^"]+)"/g)].map((m) => m[1]);
+    const urls = [...loadLibraries(root).headJS.matchAll(/src="([^"]+)"/g)].map((m) => m[1]);
     expect(urls).toEqual(['https://cdn/shared.js', 'https://cdn/a.js', 'https://cdn/b.js']);
   });
 
@@ -230,16 +254,16 @@ describe('component tier — live collection from src/components (play-mode pari
   test('an edited component (new mtime) is re-read — editor saves stay fresh', () => {
     const root = projectWith({});
     const file = writeComponent(root, 'Live.astro', `{ js: [{ url: "https://cdn/v1.js" }] }`);
-    expect(loadLibraries(root).bodyEndJS).toContain('v1.js');
+    expect(loadLibraries(root).headJS).toContain('v1.js');
 
     writeComponent(root, 'Live.astro', `{ js: [{ url: "https://cdn/v2.js" }] }`);
     // Force a distinct mtime — same-millisecond rewrites would otherwise hit the cache.
     const future = new Date(Date.now() + 5000);
     utimesSync(file, future, future);
 
-    const { bodyEndJS } = loadLibraries(root);
-    expect(bodyEndJS).toContain('v2.js');
-    expect(bodyEndJS).not.toContain('v1.js');
+    const { headJS } = loadLibraries(root);
+    expect(headJS).toContain('v2.js');
+    expect(headJS).not.toContain('v1.js');
   });
 
   test('collectAstroComponentLibraries: null without dir, empty config with empty dir', () => {
