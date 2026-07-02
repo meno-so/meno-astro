@@ -25,8 +25,10 @@ import {
   playPatchVitePlugin,
   PLAY_PATCH_EVENT,
   PLAY_STYLE_PREVIEW_EVENT,
+  PLAY_TEXT_PREVIEW_EVENT,
   PLAY_VARS_PREVIEW_EVENT,
   PLAY_CLASS_PREVIEW_EVENT,
+  PLAY_STRUCTURE_OP_EVENT,
   PATCH_JS,
   PLAY_PATCH_BRIDGE_SCRIPT,
 } from './playPatch';
@@ -1401,6 +1403,194 @@ describe('PATCH_JS (client patch)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// PATCH_JS optimistic structure ops — move/remove applied to the live DOM on
+// receipt (before the server 'structure' patch), reconciled by re-stamp only
+// ---------------------------------------------------------------------------
+
+describe('PATCH_JS optimistic structure ops (move/remove on receipt)', () => {
+  let win: Window;
+  let doc: Document;
+  let applyPatch: (
+    next: Document,
+    kinds: string[],
+    staleTokens: string[],
+    sheets: unknown,
+    op: unknown,
+    alreadyApplied?: boolean,
+  ) => void;
+  let applyStructureOpOptimistic: (op: unknown) => void;
+
+  const parse = (html: string): Document =>
+    new win.DOMParser().parseFromString(html, 'text/html') as unknown as Document;
+
+  const setup = (bodyHtml: string) => {
+    win = new Window();
+    (win as unknown as { SyntaxError: typeof SyntaxError }).SyntaxError = SyntaxError;
+    doc = win.document as unknown as Document;
+    doc.body.innerHTML = bodyHtml;
+    // resolveTarget/resolveAnchor/placeByAnchor live alongside PATCH_JS in the bridge
+    // scope, so evaluate the resolver + PATCH_JS in one scope exactly like production.
+    const fns = new Function(
+      'document',
+      `${XRAY_RESOLVER_JS}\n${PATCH_JS}\nreturn { applyPatch: applyPatch, applyStructureOpOptimistic: applyStructureOpOptimistic };`,
+    )(doc) as {
+      applyPatch: typeof applyPatch;
+      applyStructureOpOptimistic: typeof applyStructureOpOptimistic;
+    };
+    applyPatch = fns.applyPatch;
+    applyStructureOpOptimistic = fns.applyStructureOpOptimistic;
+  };
+
+  const id = (path: string) => ({ chain: [] as string[], path, item: '' });
+
+  test('move relocates the LIVE element immediately — no fetched doc, no re-stamp yet', () => {
+    setup(
+      '<section data-element-path="0"><div data-element-path="0,0">a</div><div data-element-path="0,1">b</div></section>',
+    );
+    const liveA = doc.querySelectorAll('section > div')[0]!; // "a"
+    applyStructureOpOptimistic({ kind: 'move', from: id('0,0'), toParent: id('0'), anchor: { after: id('0,1') } });
+    const divs = doc.querySelectorAll('section > div');
+    expect(divs[0]!.textContent).toBe('b');
+    expect(divs[1]!.textContent).toBe('a');
+    expect(divs[1]!).toBe(liveA); // SAME node moved (bound JS/state preserved)
+    // No re-stamp in the optimistic pass: the moved node keeps its pre-op path until
+    // the correlated 'structure' patch reconciles.
+    expect(divs[1]!.getAttribute('data-element-path')).toBe('0,0');
+  });
+
+  test('remove deletes the live target immediately (no re-stamp yet)', () => {
+    setup(
+      '<section data-element-path="0"><div data-element-path="0,0">a</div><div data-element-path="0,1">b</div></section>',
+    );
+    applyStructureOpOptimistic({ kind: 'remove', target: id('0,0') });
+    const divs = doc.querySelectorAll('section > div');
+    expect(divs.length).toBe(1);
+    expect(divs[0]!.textContent).toBe('b');
+    expect(divs[0]!.getAttribute('data-element-path')).toBe('0,1'); // untouched (no re-stamp)
+  });
+
+  test('reconcile: the follow-up structure patch (alreadyApplied) re-stamps but does NOT move again', () => {
+    setup(
+      '<section data-element-path="0"><div data-element-path="0,0">a</div><div data-element-path="0,1">b</div></section>',
+    );
+    const liveA = doc.querySelectorAll('section > div')[0]!;
+    const op = { kind: 'move', from: id('0,0'), toParent: id('0'), anchor: { after: id('0,1') } };
+    applyStructureOpOptimistic(op); // 1) optimistic apply on receipt
+    // 2) the server's 'structure' patch lands — alreadyApplied=true → re-stamp only
+    applyPatch(
+      parse(
+        '<html><body><section data-element-path="0">' +
+          '<div data-element-path="0,0">b</div><div data-element-path="0,1">a</div>' +
+          '</section></body></html>',
+      ),
+      ['structure'],
+      [],
+      undefined,
+      op,
+      true,
+    );
+    const divs = doc.querySelectorAll('section > div');
+    // NOT double-moved: still b, a — and re-stamped to the fetched post-op paths.
+    expect(divs[0]!.textContent).toBe('b');
+    expect(divs[1]!.textContent).toBe('a');
+    expect(divs[1]!).toBe(liveA); // identity preserved across the whole cycle
+    expect(divs[0]!.getAttribute('data-element-path')).toBe('0,0');
+    expect(divs[1]!.getAttribute('data-element-path')).toBe('0,1');
+  });
+
+  test('insert is unsupported by the optimistic path → throws (listener falls back to the gated apply)', () => {
+    setup('<section data-element-path="0"><div data-element-path="0,0">a</div></section>');
+    expect(() =>
+      applyStructureOpOptimistic({ kind: 'insert', parent: id('0'), newNode: id('0,1'), anchor: { after: id('0,0') } }),
+    ).toThrow();
+  });
+
+  test('an unresolvable target throws → the listener catches it and leaves the op for the gated path', () => {
+    setup('<section data-element-path="0"><div data-element-path="0,0">a</div></section>');
+    expect(() => applyStructureOpOptimistic({ kind: 'remove', target: id('9,9') })).toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PATCH_JS optimistic text preview — write a single text node on receipt,
+// reconciled (overwritten) by the real 'text' patch
+// ---------------------------------------------------------------------------
+
+describe('PATCH_JS optimistic text preview', () => {
+  let win: Window;
+  let doc: Document;
+  let applyPatch: (next: Document, kinds: string[], staleTokens: string[]) => void;
+  let applyTextPreview: (
+    target: { chain: string[]; path: string; item: string; isComponent: boolean },
+    text: string,
+  ) => void;
+
+  const parse = (html: string): Document =>
+    new win.DOMParser().parseFromString(html, 'text/html') as unknown as Document;
+
+  const setup = (bodyHtml: string) => {
+    win = new Window();
+    (win as unknown as { SyntaxError: typeof SyntaxError }).SyntaxError = SyntaxError;
+    doc = win.document as unknown as Document;
+    doc.body.innerHTML = bodyHtml;
+    const fns = new Function(
+      'document',
+      `${XRAY_RESOLVER_JS}\n${PATCH_JS}\nreturn { applyPatch: applyPatch, applyTextPreview: applyTextPreview };`,
+    )(doc) as {
+      applyPatch: typeof applyPatch;
+      applyTextPreview: typeof applyTextPreview;
+    };
+    applyPatch = fns.applyPatch;
+    applyTextPreview = fns.applyTextPreview;
+  };
+
+  const TARGET = { chain: [] as string[], path: '0', item: '', isComponent: false };
+
+  test('writes the single direct-child text node immediately', () => {
+    setup('<p data-element-path="0">old</p>');
+    applyTextPreview(TARGET, 'new text');
+    expect(doc.querySelector('p')!.textContent).toBe('new text');
+  });
+
+  test('skips an element with NO text node (nothing to write)', () => {
+    setup('<p data-element-path="0"><span>x</span></p>');
+    applyTextPreview(TARGET, 'new text');
+    // untouched — the span child is preserved, no stray text node added
+    expect(doc.querySelector('p')!.innerHTML).toBe('<span>x</span>');
+  });
+
+  test('skips (leaves to the patch) when there are MULTIPLE/interleaved text nodes', () => {
+    setup('<p data-element-path="0">a<span>b</span>c</p>');
+    applyTextPreview(TARGET, 'z');
+    // both text nodes untouched — count !== 1 → no write
+    expect(doc.querySelector('p')!.textContent).toBe('abc');
+  });
+
+  test('never clobbers element-child siblings (writes the text node only)', () => {
+    setup('<p data-element-path="0">hello<span>x</span></p>');
+    // one text node ("hello") + one element child → count === 1 → write the text node
+    applyTextPreview(TARGET, 'bye');
+    expect(doc.querySelector('p span')).not.toBeNull(); // span survives
+    expect(doc.querySelector('p')!.firstChild!.nodeValue).toBe('bye');
+  });
+
+  test('an unresolvable target is a no-op', () => {
+    setup('<p data-element-path="0">old</p>');
+    applyTextPreview({ chain: [], path: '9,9', item: '', isComponent: false }, 'new');
+    expect(doc.querySelector('p')!.textContent).toBe('old'); // untouched
+  });
+
+  test('reconcile: a following text patch (syncText) overwrites the optimistic value', () => {
+    setup('<p data-element-path="0">old</p>');
+    applyTextPreview(TARGET, 'optimistic'); // 1) instant echo
+    expect(doc.querySelector('p')!.textContent).toBe('optimistic');
+    // 2) the real 'text' patch lands with the authoritative server value
+    applyPatch(parse('<html><body><p data-element-path="0">server</p></body></html>'), ['text'], []);
+    expect(doc.querySelector('p')!.textContent).toBe('server');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // PATCH_JS optimistic style preview — resolveTarget + apply + snapshot/restore
 // ---------------------------------------------------------------------------
 
@@ -1685,6 +1875,42 @@ describe('PATCH_JS optimistic class preview', () => {
 
   const tag = () => doc.getElementById('meno-class-preview');
 
+  // Find a loaded CSSStyleRule by exact selector, optionally inside a given @media
+  // condition — for asserting the faithful in-place path mutated the REAL rule
+  // (not an appended override). Skips the managed override tag.
+  const findRule = (selector: string, media?: string): any => {
+    const norm = (s: string) => s.replace(/\s+/g, '');
+    const scan = (rules: any, inMedia: boolean): any => {
+      for (let j = 0; j < rules.length; j++) {
+        const r = rules[j];
+        if (r.cssRules && r.media) {
+          const cond = r.media?.mediaText || r.conditionText || '';
+          if (media && norm(cond) === norm(media)) {
+            const hit = scan(r.cssRules, true);
+            if (hit) return hit;
+          }
+          continue;
+        }
+        if (!media === !inMedia && r.selectorText === selector) return r;
+      }
+      return null;
+    };
+    const sheets = doc.styleSheets as any;
+    for (let i = 0; i < sheets.length; i++) {
+      if (sheets[i].ownerNode && sheets[i].ownerNode.id === 'meno-class-preview') continue;
+      if (tag() && sheets[i] === (tag() as unknown as { sheet: unknown }).sheet) continue;
+      let rules: unknown;
+      try {
+        rules = sheets[i].cssRules;
+      } catch {
+        continue;
+      }
+      const hit = scan(rules, false);
+      if (hit) return hit;
+    }
+    return null;
+  };
+
   const setup = (headHtml = '') => {
     win = new Window();
     (win as unknown as { SyntaxError: typeof SyntaxError }).SyntaxError = SyntaxError;
@@ -1763,14 +1989,87 @@ describe('PATCH_JS optimistic class preview', () => {
     expect(tag()!.textContent).toContain('.button { padding: 24px; }');
   });
 
-  test('removal preview overrides the property to `revert` (an additive sheet cannot truly unset)', () => {
-    setup();
-    // The "CSS Classes" panel previews a property REMOVAL by overriding it to
-    // `revert` — the override sheet can only ADD rules, so it approximates "gone"
-    // by reverting to the UA / earlier-origin value. (The real file write is the
-    // source of truth; a natural reload then drops the override entirely.)
+  test('FAITHFUL path: mutates the real loaded rule in place — no appended override tag', () => {
+    setup('<style>.button { padding: 10px; }</style>');
+    applyClassPreview('button', 'padding', '24px', '', '');
+    // The real rule is edited where it lives; no override sheet is appended, so
+    // the rule keeps its original source position + specificity (the whole point).
+    expect(findRule('.button').style.getPropertyValue('padding')).toBe('24px');
+    expect(tag()).toBeNull();
+  });
+
+  test('FAITHFUL path: edits the LAST source-order match so the cascade winner is preserved', () => {
+    // The bug this fixes: appending a fresh rule LAST wrongly promotes a shadowed
+    // (equal-specificity, earlier) class to win. Here `.button` (later) is the
+    // cascade winner for an element carrying both classes; editing the earlier
+    // `.text-white` must leave `.button` winning — exactly as a real file save.
+    setup('<style>.text-white { color: white; } .button { color: black; }</style>');
+    applyClassPreview('text-white', 'color', 'red', '', '');
+    expect(findRule('.text-white').style.getPropertyValue('color')).toBe('red');
+    // `.button` is untouched → it still wins the cascade (no source-order hijack).
+    expect(findRule('.button').style.getPropertyValue('color')).toBe('black');
+    expect(tag()).toBeNull();
+  });
+
+  test('FAITHFUL path: a duplicated selector mutates the LAST occurrence (cascade winner)', () => {
+    setup('<style>.button { color: red; }</style><style>.button { color: blue; }</style>');
+    applyClassPreview('button', 'color', 'green', '', '');
+    // Both sheets carry `.button { color }`; only the last (the winner) is edited.
+    const rules = doc.styleSheets as unknown as ArrayLike<{
+      cssRules: { length: number; [k: number]: { style: { getPropertyValue: (p: string) => string } } };
+    }>;
+    expect(rules[0]!.cssRules[0]!.style.getPropertyValue('color')).toBe('red');
+    expect(rules[1]!.cssRules[0]!.style.getPropertyValue('color')).toBe('green');
+    expect(tag()).toBeNull();
+  });
+
+  test('FAITHFUL path: a media edit targets the rule inside the matching @media only', () => {
+    setup('<style>.button { padding: 1px; } @media (max-width: 540px) { .button { padding: 2px; } }</style>');
+    applyClassPreview('button', 'padding', '9px', '', '(max-width: 540px)');
+    expect(findRule('.button', '(max-width: 540px)').style.getPropertyValue('padding')).toBe('9px');
+    // The base rule is left alone — a breakpoint edit must not leak to base.
+    expect(findRule('.button').style.getPropertyValue('padding')).toBe('1px');
+    expect(tag()).toBeNull();
+  });
+
+  test('FAITHFUL path: a removal DELETES the property from the real rule (not a `revert` hack)', () => {
+    setup('<style>.button { padding: 24px; color: red; }</style>');
     applyClassPreview('button', 'padding', 'revert', '', '');
-    expect(tag()!.textContent).toContain('.button { padding: revert; }');
+    // In place we can do the real thing: the property is gone, siblings untouched.
+    expect(findRule('.button').style.getPropertyValue('padding')).toBe('');
+    expect(findRule('.button').style.getPropertyValue('color')).toBe('red');
+    expect(tag()).toBeNull();
+  });
+
+  test('FALLBACK path: with no accessible matching rule, appends the override sheet', () => {
+    // happy-dom does not parse the <link>, so no rule is readable → the appended
+    // override sheet is the only way to preview (the real-browser link would parse
+    // and take the faithful path instead).
+    setup('<link rel="stylesheet" href="/_mirror/css/site.css">');
+    applyClassPreview('button', 'padding', '24px', '', '');
+    expect(tag()!.textContent).toContain('.button { padding: 24px; }');
+    // A removal with no matching rule is a no-op (an additive sheet cannot unset).
+    setup('<link rel="stylesheet" href="/_mirror/css/site.css">');
+    applyClassPreview('button', 'padding', 'revert', '', '');
+    expect(tag()).toBeNull();
+  });
+
+  test('FAITHFUL path is STICKY — a theme.css patch leaves the in-place mirror edit intact', () => {
+    // The mirror sheet (not theme.css) carries the edited rule; a theme.css sheet
+    // swap must not revert it (there is no regenerated mirror sheet to supersede it).
+    setup(
+      '<style>.button { padding: 10px; }</style>' +
+        '<style data-vite-dev-id="/proj/src/styles/theme.css">:root{--x:1}</style>',
+    );
+    applyClassPreview('button', 'padding', '24px', '', '');
+    expect(findRule('.button').style.getPropertyValue('padding')).toBe('24px');
+    applyPatch(
+      parse('<html><head></head><body><div data-element-path="0">x</div></body></html>'),
+      ['style'],
+      [],
+      [{ match: 'styles/theme.css', css: ':root{--x:2}' }],
+    );
+    expect(findRule('.button').style.getPropertyValue('padding')).toBe('24px');
   });
 
   test('is STICKY — a real patch does NOT clear it (mirror CSS has no recompile)', () => {
@@ -1818,10 +2117,25 @@ describe('bridge contract', () => {
     expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain("addEventListener('message'");
   });
 
+  test('bridge listens for optimistic text previews', () => {
+    expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain(`'${PLAY_TEXT_PREVIEW_EVENT}'`);
+    expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain('applyTextPreview');
+  });
+
   test('bridge listens for optimistic variable previews', () => {
     expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain(`'${PLAY_VARS_PREVIEW_EVENT}'`);
     expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain('applyVarsPreview');
     expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain('meno-vars-preview');
+  });
+
+  test('bridge buffers editor structure ops and applies move/remove optimistically on receipt', () => {
+    expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain(`'${PLAY_STRUCTURE_OP_EVENT}'`);
+    expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain('applyStructureOpOptimistic');
+    // gated ONLY when nothing is mid-flight, so the exactly-one-op-per-patch invariant holds
+    expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain('opQueue.length === 0');
+    expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain('!inflight');
+    // the buffered entry carries the applied flag the patch reconcile reads
+    expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain('applied: applied');
   });
 
   test('bridge preserves scroll position across the full reloads that remain', () => {

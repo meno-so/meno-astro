@@ -137,6 +137,17 @@ export const PLAY_COMMENT_MODE_MESSAGE_TYPE = 'meno:astro:comment-mode';
 export const PLAY_COMMENT_RECTS_MESSAGE_TYPE = 'meno:astro:comment-rects';
 export const PLAY_COMMENT_PLACE_MESSAGE_TYPE = 'meno:astro:comment-place';
 
+/**
+ * The spacing-ruler overlay also rides the X-Ray bridge (one in-page script
+ * owns identity resolution + the rAF loop). Editor → bridge: `ruler` carries
+ * the selected node's identity target + a visibility flag; the bridge resolves
+ * it (resolveTarget), measures margin / padding / flex-grid gap via
+ * getComputedStyle, and draws the colored rects IN-PAGE — the cross-origin twin
+ * of studio's RulerOverlay. Unlike comments there is no back-channel: the
+ * overlay is purely visual, so nothing streams to editor React state.
+ */
+export const PLAY_RULER_MESSAGE_TYPE = 'meno:astro:ruler';
+
 /** The prop/attribute carrying a component instance's path at its usage site. */
 export const INSTANCE_ATTR = 'data-meno-instance';
 
@@ -654,6 +665,236 @@ export const XRAY_SCROLL_JS = `
 `;
 
 /**
+ * The in-page spacing-ruler math — injected into {@link PLAY_XRAY_BRIDGE_SCRIPT}
+ * verbatim and unit-testable the same way as {@link XRAY_RESOLVER_JS} (eval the
+ * string against a stub `window` exposing `getComputedStyle`). A faithful port
+ * of studio's RulerOverlay `computeGapRects` / `groupByAxis` and its rect-build
+ * pass, drawn at 1:1 page pixels (the bridge runs INSIDE the iframe, so the
+ * parent's canvas transform is applied by the browser to the iframe element —
+ * no zoom / canvasScale term is needed here, unlike the same-origin overlay).
+ *
+ * Returns viewport-local boxes `{ top, left, width, height, color, value }`
+ * (getBoundingClientRect coords — the ruler container is `position:fixed;inset:0`).
+ * Margin = amber, padding = green, flex/grid gap = purple, matching RulerOverlay's
+ * palette. Zero / negative bands are dropped exactly as RulerOverlay's rectStyle does.
+ * Closes over `window`, so tests can inject a `getComputedStyle` stub.
+ */
+export const RULER_SPACING_JS = `
+    var RULER_MARGIN_COLOR = 'rgba(251, 191, 36, 0.3)';
+    var RULER_PADDING_COLOR = 'rgba(34, 197, 94, 0.35)';
+    var RULER_GAP_COLOR = 'rgba(168, 85, 247, 0.25)';
+
+    // Group rects by their center on a given axis (RulerOverlay.groupByAxis).
+    function rulerGroupByAxis(rects, posKey, sizeKey) {
+      var groups = [];
+      var tolerance = 2;
+      for (var n = 0; n < rects.length; n++) {
+        var rect = rects[n];
+        var center = rect[posKey] + rect[sizeKey] / 2;
+        var placed = false;
+        for (var g = 0; g < groups.length; g++) {
+          var first = groups[g][0];
+          if (!first) continue;
+          var groupCenter = first[posKey] + first[sizeKey] / 2;
+          if (Math.abs(center - groupCenter) < Math.max(rect[sizeKey], first[sizeKey]) / 2 + tolerance) {
+            groups[g].push(rect);
+            placed = true;
+            break;
+          }
+        }
+        if (!placed) groups.push([rect]);
+      }
+      return groups;
+    }
+
+    function rulerMin(rects, key) { var m = Infinity; for (var i = 0; i < rects.length; i++) if (rects[i][key] < m) m = rects[i][key]; return m; }
+    function rulerMax(rects, key) { var m = -Infinity; for (var i = 0; i < rects.length; i++) if (rects[i][key] > m) m = rects[i][key]; return m; }
+
+    // Gap rects between visible flex/grid children (RulerOverlay.computeGapRects).
+    function rulerComputeGapRects(element, computed) {
+      var display = computed.display;
+      var isFlex = display === 'flex' || display === 'inline-flex';
+      var isGrid = display === 'grid' || display === 'inline-grid';
+      if (!isFlex && !isGrid) return [];
+
+      var rowGap = parseFloat(computed.rowGap) || 0;
+      var columnGap = parseFloat(computed.columnGap) || 0;
+      if (rowGap === 0 && columnGap === 0) return [];
+
+      var kids = [];
+      for (var c = 0; c < element.children.length; c++) kids.push(element.children[c]);
+      if (kids.length < 2) return [];
+
+      var childRects = [];
+      for (var k = 0; k < kids.length; k++) {
+        var cs = window.getComputedStyle(kids[k]);
+        if (cs && (cs.display === 'none' || cs.visibility === 'hidden')) continue;
+        var kr = kids[k].getBoundingClientRect();
+        if (kr.width === 0 && kr.height === 0) continue;
+        childRects.push(kr);
+      }
+      if (childRects.length < 2) return [];
+
+      var gaps = [];
+      var i, a, b;
+
+      if (isFlex) {
+        var direction = computed.flexDirection;
+        var isRow = direction === 'row' || direction === 'row-reverse';
+        var isWrap = computed.flexWrap === 'wrap' || computed.flexWrap === 'wrap-reverse';
+
+        if (isRow) {
+          var rows = rulerGroupByAxis(childRects, 'top', 'height');
+          for (var r0 = 0; r0 < rows.length; r0++) {
+            if (columnGap > 0) {
+              var sortedR = rows[r0].slice().sort(function (x, y) { return x.left - y.left; });
+              for (i = 0; i < sortedR.length - 1; i++) {
+                a = sortedR[i]; b = sortedR[i + 1];
+                if (!a || !b) continue;
+                var gwR = b.left - a.right;
+                if (gwR > 0) {
+                  var gtR = Math.min(a.top, b.top);
+                  var gbR = Math.max(a.bottom, b.bottom);
+                  gaps.push({ top: gtR, left: a.right, width: gwR, height: gbR - gtR, value: columnGap });
+                }
+              }
+            }
+          }
+          if (isWrap && rowGap > 0 && rows.length > 1) {
+            var rowBands = [];
+            for (var rb = 0; rb < rows.length; rb++) {
+              rowBands.push({
+                top: rulerMin(rows[rb], 'top'), bottom: rulerMax(rows[rb], 'bottom'),
+                left: rulerMin(rows[rb], 'left'), right: rulerMax(rows[rb], 'right'),
+              });
+            }
+            rowBands.sort(function (x, y) { return x.top - y.top; });
+            for (i = 0; i < rowBands.length - 1; i++) {
+              a = rowBands[i]; b = rowBands[i + 1];
+              if (!a || !b) continue;
+              var ghRow = b.top - a.bottom;
+              if (ghRow > 0) {
+                var pr1 = element.getBoundingClientRect();
+                gaps.push({ top: a.bottom, left: pr1.left, width: pr1.width, height: ghRow, value: rowGap });
+              }
+            }
+          }
+        } else {
+          var cols = rulerGroupByAxis(childRects, 'left', 'width');
+          for (var c0 = 0; c0 < cols.length; c0++) {
+            if (rowGap > 0) {
+              var sortedC = cols[c0].slice().sort(function (x, y) { return x.top - y.top; });
+              for (i = 0; i < sortedC.length - 1; i++) {
+                a = sortedC[i]; b = sortedC[i + 1];
+                if (!a || !b) continue;
+                var ghCol = b.top - a.bottom;
+                if (ghCol > 0) {
+                  var glCol = Math.min(a.left, b.left);
+                  var grCol = Math.max(a.right, b.right);
+                  gaps.push({ top: a.bottom, left: glCol, width: grCol - glCol, height: ghCol, value: rowGap });
+                }
+              }
+            }
+          }
+          if (isWrap && columnGap > 0 && cols.length > 1) {
+            var colBands = [];
+            for (var cb = 0; cb < cols.length; cb++) {
+              colBands.push({
+                top: rulerMin(cols[cb], 'top'), bottom: rulerMax(cols[cb], 'bottom'),
+                left: rulerMin(cols[cb], 'left'), right: rulerMax(cols[cb], 'right'),
+              });
+            }
+            colBands.sort(function (x, y) { return x.left - y.left; });
+            for (i = 0; i < colBands.length - 1; i++) {
+              a = colBands[i]; b = colBands[i + 1];
+              if (!a || !b) continue;
+              var gwCol = b.left - a.right;
+              if (gwCol > 0) {
+                var pr2 = element.getBoundingClientRect();
+                gaps.push({ top: pr2.top, left: a.right, width: gwCol, height: pr2.height, value: columnGap });
+              }
+            }
+          }
+        }
+      } else {
+        if (columnGap > 0) {
+          var gridRows = rulerGroupByAxis(childRects, 'top', 'height');
+          for (var gr = 0; gr < gridRows.length; gr++) {
+            var byLeft = gridRows[gr].slice().sort(function (x, y) { return x.left - y.left; });
+            for (i = 0; i < byLeft.length - 1; i++) {
+              a = byLeft[i]; b = byLeft[i + 1];
+              if (!a || !b) continue;
+              var gwG = b.left - a.right;
+              if (gwG > 0) {
+                var gtG = Math.min(a.top, b.top);
+                var gbG = Math.max(a.bottom, b.bottom);
+                gaps.push({ top: gtG, left: a.right, width: gwG, height: gbG - gtG, value: columnGap });
+              }
+            }
+          }
+        }
+        if (rowGap > 0) {
+          var gridCols = rulerGroupByAxis(childRects, 'left', 'width');
+          for (var gc = 0; gc < gridCols.length; gc++) {
+            var byTop = gridCols[gc].slice().sort(function (x, y) { return x.top - y.top; });
+            for (i = 0; i < byTop.length - 1; i++) {
+              a = byTop[i]; b = byTop[i + 1];
+              if (!a || !b) continue;
+              var ghG = b.top - a.bottom;
+              if (ghG > 0) {
+                var glG = Math.min(a.left, b.left);
+                var grG = Math.max(a.right, b.right);
+                gaps.push({ top: a.bottom, left: glG, width: grG - glG, height: ghG, value: rowGap });
+              }
+            }
+          }
+        }
+      }
+      return gaps;
+    }
+
+    // Margin/padding/gap boxes for a resolved element, in viewport coords
+    // (RulerOverlay's rect-build pass at s = 1). Empty when the element is
+    // collapsed (0x0).
+    function rulerBuildBoxes(el) {
+      var bounds = el.getBoundingClientRect();
+      if (bounds.width === 0 && bounds.height === 0) return [];
+      var computed = window.getComputedStyle(el);
+      var margin = {
+        top: parseFloat(computed.marginTop) || 0, right: parseFloat(computed.marginRight) || 0,
+        bottom: parseFloat(computed.marginBottom) || 0, left: parseFloat(computed.marginLeft) || 0,
+      };
+      var padding = {
+        top: parseFloat(computed.paddingTop) || 0, right: parseFloat(computed.paddingRight) || 0,
+        bottom: parseFloat(computed.paddingBottom) || 0, left: parseFloat(computed.paddingLeft) || 0,
+      };
+      var gaps = rulerComputeGapRects(el, computed);
+
+      var elTop = bounds.top, elLeft = bounds.left, elWidth = bounds.width, elHeight = bounds.height;
+      var boxes = [];
+      function add(top, left, width, height, color, value) {
+        if (value <= 0 || width <= 0 || height <= 0) return;
+        boxes.push({ top: top, left: left, width: width, height: height, color: color, value: value });
+      }
+
+      add(elTop - margin.top, elLeft, elWidth, margin.top, RULER_MARGIN_COLOR, margin.top);
+      add(elTop + elHeight, elLeft, elWidth, margin.bottom, RULER_MARGIN_COLOR, margin.bottom);
+      add(elTop - margin.top, elLeft - margin.left, margin.left, elHeight + margin.top + margin.bottom, RULER_MARGIN_COLOR, margin.left);
+      add(elTop - margin.top, elLeft + elWidth, margin.right, elHeight + margin.top + margin.bottom, RULER_MARGIN_COLOR, margin.right);
+
+      add(elTop, elLeft, elWidth, padding.top, RULER_PADDING_COLOR, padding.top);
+      add(elTop + elHeight - padding.bottom, elLeft, elWidth, padding.bottom, RULER_PADDING_COLOR, padding.bottom);
+      add(elTop + padding.top, elLeft, padding.left, elHeight - padding.top - padding.bottom, RULER_PADDING_COLOR, padding.left);
+      add(elTop + padding.top, elLeft + elWidth - padding.right, padding.right, elHeight - padding.top - padding.bottom, RULER_PADDING_COLOR, padding.right);
+
+      for (var i = 0; i < gaps.length; i++) {
+        add(gaps[i].top, gaps[i].left, gaps[i].width, gaps[i].height, RULER_GAP_COLOR, gaps[i].value);
+      }
+      return boxes;
+    }
+`;
+
+/**
  * The injected head script rendering X-Ray borders in-page. Visual parity with
  * the studio's XRayOverlay: 1px border (components green #01a256, nodes blue
  * #007cee), selected at full opacity / hovered at 0.5 (label always full),
@@ -712,6 +953,7 @@ if (window.self !== window.top) {
 
 ${XRAY_RESOLVER_JS}
 ${XRAY_SCROLL_JS}
+${RULER_SPACING_JS}
 
     function makeBox() {
       var box = document.createElement('div');
@@ -1119,6 +1361,101 @@ ${XRAY_SCROLL_JS}
       commentCursorApplied = false;
       applyCommentCursor();
       scheduleComments();
+    });
+
+    // ---- spacing ruler (editor → bridge) ----
+    // The selected node's margin / padding / flex-grid gap visualized in-page —
+    // the cross-origin twin of studio's RulerOverlay, which can't measure this
+    // frame's DOM. The editor posts the selected element's identity + a
+    // visibility flag; the bridge resolves it (resolveTarget, the same identity
+    // the x-ray border uses), measures spacing via rulerBuildBoxes, and draws
+    // the colored rects itself in a rAF loop so they track scroll / reflow.
+    var rulerVisible = false;
+    var rulerTarget = null;
+    var rulerEl = null;
+    var rulerContainer = null;
+    var rulerRaf = 0;
+
+    function ensureRulerContainer() {
+      if (rulerContainer && rulerContainer.isConnected) return rulerContainer;
+      if (!document.body) return null;
+      rulerContainer = document.createElement('div');
+      rulerContainer.setAttribute('data-meno-ruler', '');
+      // Below the x-ray container (2147483646) so a selection border still wins,
+      // above the page. inset:0 → children position in viewport coordinates.
+      rulerContainer.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483645;overflow:hidden;';
+      document.body.appendChild(rulerContainer);
+      return rulerContainer;
+    }
+
+    function makeRulerBox() {
+      var box = document.createElement('div');
+      box.style.cssText = 'position:absolute;pointer-events:none;';
+      var label = document.createElement('span');
+      label.style.cssText = 'position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:10px;line-height:14px;padding:1px 4px;border-radius:3px;white-space:nowrap;color:#fff;background:rgba(0,0,0,0.7);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;';
+      box.appendChild(label);
+      return box;
+    }
+
+    function rulerFrame() {
+      rulerRaf = 0;
+      var c = ensureRulerContainer();
+      if (!c) return;
+      if (!rulerVisible || !rulerTarget) { c.style.display = 'none'; return; }
+      if (!rulerEl || !rulerEl.isConnected) rulerEl = resolveTarget(rulerTarget);
+      var boxes = rulerEl ? rulerBuildBoxes(rulerEl) : [];
+      c.style.display = boxes.length ? 'block' : 'none';
+      while (c.children.length < boxes.length) c.appendChild(makeRulerBox());
+      while (c.children.length > boxes.length) c.removeChild(c.lastChild);
+      for (var i = 0; i < boxes.length; i++) {
+        var b = boxes[i];
+        var box = c.children[i];
+        box.style.left = b.left + 'px';
+        box.style.top = b.top + 'px';
+        box.style.width = b.width + 'px';
+        box.style.height = b.height + 'px';
+        box.style.backgroundColor = b.color;
+        // RulerOverlay hides labels for bands thinner than 16px (its createLabel gate).
+        var label = box.children[0];
+        if (b.value >= 16) {
+          label.style.display = 'block';
+          label.textContent = String(Math.round(b.value));
+        } else {
+          label.style.display = 'none';
+        }
+      }
+      // Keep re-measuring while the ruler is shown so it tracks scroll / reflow.
+      if (rulerVisible && rulerTarget) rulerRaf = requestAnimationFrame(rulerFrame);
+    }
+
+    function scheduleRuler() {
+      if (!rulerRaf && rulerVisible && rulerTarget) rulerRaf = requestAnimationFrame(rulerFrame);
+    }
+
+    window.addEventListener('message', function (ev) {
+      var d = ev && ev.data;
+      if (!d || d.type !== '${PLAY_RULER_MESSAGE_TYPE}') return;
+      rulerVisible = !!d.visible;
+      var t = d.target;
+      rulerTarget = rulerVisible && t && typeof t === 'object'
+        ? {
+            chain: Array.isArray(t.chain) ? t.chain.map(String) : [],
+            path: String(t.path || ''),
+            item: typeof t.item === 'string' ? t.item : '',
+            isComponent: !!t.isComponent,
+          }
+        : null;
+      rulerEl = null;
+      if (!rulerVisible || !rulerTarget) {
+        if (rulerContainer) rulerContainer.style.display = 'none';
+      } else {
+        scheduleRuler();
+      }
+    });
+
+    document.addEventListener('astro:page-load', function () {
+      rulerEl = null;
+      scheduleRuler();
     });
   })();
 }

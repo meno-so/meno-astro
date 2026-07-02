@@ -32,6 +32,7 @@ import {
   PLAY_COMMENT_MODE_MESSAGE_TYPE,
   PLAY_COMMENT_RECTS_MESSAGE_TYPE,
   PLAY_COMMENT_PLACE_MESSAGE_TYPE,
+  PLAY_RULER_MESSAGE_TYPE,
 } from './xray';
 import { PLAY_PATCH_BRIDGE_SCRIPT } from './playPatch';
 import {
@@ -406,6 +407,21 @@ describe('meno() integration', () => {
     expect(PLAY_XRAY_BRIDGE_SCRIPT).toContain('id: t.id');
     expect(PLAY_XRAY_BRIDGE_SCRIPT).toContain('crosshair');
     expect(PLAY_XRAY_BRIDGE_SCRIPT).toContain('preventDefault');
+    expect(PLAY_XRAY_BRIDGE_SCRIPT).toContain('astro:page-load');
+  });
+
+  test('x-ray bridge carries the spacing-ruler editor message contract', () => {
+    // The studio matches this literal (see lib/client/utils/astroPlayMessages.ts
+    // — it deliberately doesn't import from meno-astro). Drift here silently
+    // breaks the ruler overlay over the cross-origin play iframe.
+    expect(PLAY_RULER_MESSAGE_TYPE).toBe('meno:astro:ruler');
+    expect(PLAY_XRAY_BRIDGE_SCRIPT).toContain(`'${PLAY_RULER_MESSAGE_TYPE}'`);
+    // The ruler resolves the selected node's identity via the SHARED resolver
+    // and draws its spacing bands in-page (no back-channel), re-measuring across
+    // soft navigations.
+    expect(PLAY_XRAY_BRIDGE_SCRIPT).toContain('rulerBuildBoxes');
+    expect(PLAY_XRAY_BRIDGE_SCRIPT).toContain('resolveTarget(rulerTarget)');
+    expect(PLAY_XRAY_BRIDGE_SCRIPT).toContain('data-meno-ruler');
     expect(PLAY_XRAY_BRIDGE_SCRIPT).toContain('astro:page-load');
   });
 

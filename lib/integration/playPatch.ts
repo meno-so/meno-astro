@@ -130,6 +130,16 @@ export const PLAY_PATCH_EVENT = 'meno:astro:patch';
 export const PLAY_STYLE_PREVIEW_EVENT = 'meno:astro:style-preview';
 
 /**
+ * postMessage type for the optimistic plain-text preview. Payload
+ * `{ target: { chain, path, item, isComponent }, text }`. The bridge writes the
+ * string into the resolved element's single direct-child text node so a text
+ * edit shows instantly, before astro recompiles and the real 'text' patch
+ * (syncText) reconciles by overwrite. Plain text only — formatted/rich-text is
+ * not previewed. Must match the studio's ASTRO_PLAY_TEXT_PREVIEW_MESSAGE_TYPE literal.
+ */
+export const PLAY_TEXT_PREVIEW_EVENT = 'meno:astro:text-preview';
+
+/**
  * postMessage type for the optimistic CSS-variable (design-token) preview.
  * Payload `{ vars: { '--name': value, … }, media }`. The bridge applies the
  * vars as a single `:root` override `<style>` (one global update cascades to
@@ -1257,6 +1267,33 @@ export const PATCH_JS = `
       applyDeclString(el, css);
     }
 
+    // ---- optimistic plain-text preview ---------------------------------------
+    // The editor posts the just-typed string (meno:astro:text-preview) so a text
+    // edit shows instantly, before astro recompiles and the real 'text' patch
+    // lands ~1s later. We write into a DIRECT-CHILD text node (never textContent,
+    // which would delete element children) — exactly how syncText reconciles it.
+    // Only the unambiguous single-text-node case is safe; interleaved / multi-
+    // text-node elements are left to the real patch (studio only emits for plain
+    // text, so a rich-text value never reaches here). No snapshot/restore: text has
+    // no cascade hazard and syncText overwrites the value on the next patch, so the
+    // preview is sticky-until-patch (like applyClassPreview). Writing nodeValue is
+    // inherently escape-safe (no innerHTML). resolveTarget comes from XRAY_RESOLVER_JS.
+    function applyTextPreview(target, text) {
+      if (typeof text !== 'string') return;
+      var el = resolveTarget(target);
+      if (!el) return;
+      var node = null;
+      var count = 0;
+      for (var c = el.firstChild; c; c = c.nextSibling) {
+        if (c.nodeType === 3) {
+          node = c;
+          count++;
+        }
+      }
+      if (count !== 1) return; // ambiguous → leave to the 'text' patch
+      if (node.nodeValue !== text) node.nodeValue = text;
+    }
+
     // ---- optimistic CSS-variable (design-token) preview ----------------------
     // A variable maps to a :root custom property, so ONE global override
     // cascades to every var(--name) consumer instantly — no per-element work.
@@ -1313,14 +1350,26 @@ export const PATCH_JS = `
     // Editing a mirror-imported class (.button { padding: … }) writes the CSS
     // file, but public/ has no recompile/HMR — so without this the change shows
     // only after a manual reload. The editor posts the changed declaration
-    // { className, property (kebab), value, state, media }; we accumulate per
-    // (media|state|className → property) so several edits stack, and render one
-    // managed <style id="meno-class-preview"> appended LAST (wins source order
-    // over the mirror <link>). STICKY: there is no real patch to clear it (unlike
-    // style/vars preview); the persisted file is loaded fresh — override gone —
-    // on the next natural reload. The .class selector mirrors the file edit
-    // exactly, so the cascade (e.g. a more-specific .button.cc-jumbo still
-    // winning) behaves identically to a real save.
+    // { className, property (kebab), value, state, media }.
+    //
+    // FAITHFUL path (mutateMirrorRules): mutate the REAL rule where it already
+    // lives in the loaded CSSOM — set/remove the property on the matching
+    // CSSStyleRule — so its source position + specificity are preserved and the
+    // browser's cascade resolves EXACTLY as it will after the file save+reload.
+    // This is the primary path; the file-save (StylesheetService) does the same
+    // in-place edit, so preview == saved result.
+    //
+    // FALLBACK path (the managed <style id="meno-class-preview"> below): only when
+    // no accessible rule matches (a <link> sheet not parsed yet, a cross-origin
+    // sheet). It APPENDS the rule LAST — which is why it can only be a fallback:
+    // an appended rule gets artificially-late source order, so editing a class
+    // that is NOT the cascade winner (a combo/utility class shadowed by a later
+    // equal-specificity rule — endemic to Webflow mirrors, e.g. a .button rule
+    // sitting after a .text-color-white rule) would wrongly win in the preview yet
+    // lose after a real save, forcing a manual reload to "see the real result". The in-place
+    // path above fixes that; this stays for the rare no-matching-rule case.
+    // STICKY: no real patch clears either (mirror CSS has no recompile); a natural
+    // reload re-fetches the file with the real (persisted) value.
     var optimisticClasses = {};
     var optimisticClassesTag = null;
     function renderClassesTag() {
@@ -1357,6 +1406,93 @@ export const PATCH_JS = `
       }
       optimisticClassesTag.textContent = css;
     }
+    // Normalize a media condition for tolerant comparison (the CSSOM may serialize
+    // it with different spacing/casing than the panel's stored condition string).
+    // (Spaces only — CSSOM mediaText has no tabs/newlines; and this runs INSIDE a
+    // template literal, so a backslash regex escape like the whitespace class would
+    // be consumed — literal-space stripping sidesteps that.)
+    function normMedia(s) {
+      return String(s || '')
+        .split(' ')
+        .join('')
+        .toLowerCase();
+    }
+    // Does a rule's selector (possibly a group ".a, .b:hover") contain the target
+    // as one exact member? Mirrors the file-save's selectorListIncludes — only a
+    // standalone simple selector is ever edited (a descendant member like ".a .b"
+    // just won't equal a simple target, so trim-and-compare suffices).
+    function selectorListHas(selectorText, target) {
+      var parts = String(selectorText || '').split(',');
+      for (var i = 0; i < parts.length; i++) {
+        if (parts[i].trim() === target) return true;
+      }
+      return false;
+    }
+    // Collect the .style of every rule matching the selector at the requested media
+    // scope, in document/source order. A base edit (wantMedia false) matches only
+    // rules OUTSIDE any @media; a media edit descends only into the matching
+    // @media block. Duck-typed (media rule = has .media + .cssRules) so it's engine
+    // agnostic and skips @supports/@layer wrappers (as the file-save does).
+    function collectMirrorMatches(rules, selector, media, wantMedia, out) {
+      if (!rules) return;
+      for (var i = 0; i < rules.length; i++) {
+        var r = rules[i];
+        if (r.cssRules && r.media) {
+          var cond = (r.media && r.media.mediaText) || r.conditionText || '';
+          if (wantMedia && normMedia(cond) === normMedia(media)) {
+            collectMirrorMatches(r.cssRules, selector, media, false, out);
+          }
+          continue;
+        }
+        if (!wantMedia && r.style && r.selectorText && selectorListHas(r.selectorText, selector)) {
+          out.push(r.style);
+        }
+      }
+    }
+    // FAITHFUL preview: edit the real rule(s) in the loaded CSSOM in place, so the
+    // browser's cascade resolves exactly as after the file save+reload. Update
+    // targets the LAST source-order match (appending the property if absent) —
+    // matching StylesheetService's cascade-winner rule; removal deletes the
+    // property from EVERY match in scope — matching its removeClassDeclaration.
+    // Returns true when at least one accessible rule matched.
+    function mutateMirrorRules(selector, kebab, value, media, isRemoval) {
+      var sheets = document.styleSheets;
+      if (!sheets) return false;
+      var matches = [];
+      var wantMedia = !!media;
+      // Our own managed override tags, skipped below so the faithful path never
+      // re-reads what the fallback path wrote (they must not observe each other).
+      var ownClassSheet = optimisticClassesTag && optimisticClassesTag.sheet;
+      var ownVarsSheet = optimisticVarsTag && optimisticVarsTag.sheet;
+      for (var s = 0; s < sheets.length; s++) {
+        var sheet = sheets[s];
+        // Skip our managed tags: by sheet identity (works even where ownerNode is
+        // unset) plus an id check on ownerNode as a real-browser backstop.
+        if (sheet === ownClassSheet || sheet === ownVarsSheet) continue;
+        var owner = sheet.ownerNode;
+        if (owner && (owner.id === 'meno-class-preview' || owner.id === 'meno-vars-preview')) continue;
+        var rules;
+        try {
+          rules = sheet.cssRules;
+        } catch (e) {
+          continue; // cross-origin sheet — rules not readable
+        }
+        collectMirrorMatches(rules, selector, media, wantMedia, matches);
+      }
+      if (matches.length === 0) return false;
+      if (isRemoval) {
+        for (var j = 0; j < matches.length; j++) {
+          try {
+            matches[j].removeProperty(kebab);
+          } catch (e) {}
+        }
+      } else {
+        try {
+          matches[matches.length - 1].setProperty(kebab, value);
+        } catch (e) {}
+      }
+      return true;
+    }
     function applyClassPreview(className, property, value, state, media, kind) {
       // Injection guards (textContent CSS, same rigor as applyVarsPreview): a bare
       // class/tag token, a kebab property (optional leading -- for custom props), a
@@ -1368,7 +1504,32 @@ export const PATCH_JS = `
       var m = typeof media === 'string' && !/[{}<>;]/.test(media) ? media : '';
       // kind 'tag' targets a bare element selector (h1, a); anything else a .class.
       var selector = (kind === 'tag' ? '' : '.') + className + st;
-      optimisticClasses[m + '|' + selector + '|' + property] = {
+      var key = m + '|' + selector + '|' + property;
+      // A removal preview arrives as the 'revert' sentinel; in place we can do the
+      // real thing (delete the property) instead of the additive-sheet approximation.
+      var isRemoval = value === 'revert';
+
+      // 1) Faithful path — mutate the real matching rule(s) where they live.
+      if (mutateMirrorRules(selector, property, value, m, isRemoval)) {
+        // Drop any earlier fallback override for this key so the two can't stack.
+        if (optimisticClasses[key]) {
+          delete optimisticClasses[key];
+          renderClassesTag();
+        }
+        return;
+      }
+
+      // 2) Fallback — no accessible matching rule; use the appended override sheet.
+      // A removal has nothing to append (an additive sheet can't unset), so just
+      // clear any prior fallback for this key.
+      if (isRemoval) {
+        if (optimisticClasses[key]) {
+          delete optimisticClasses[key];
+          renderClassesTag();
+        }
+        return;
+      }
+      optimisticClasses[key] = {
         media: m,
         selector: selector,
         property: property,
@@ -1565,12 +1726,46 @@ export const PATCH_JS = `
       mutate();
     }
 
+    // Optimistic (pre-patch) structural mutation: applied the instant the editor
+    // posts the op, BEFORE the server recompile + 'structure' patch land — so a
+    // move/delete shows in the play iframe immediately instead of after the multi-
+    // second save→rebuild→patch round-trip. move/remove resolve entirely against the
+    // LIVE pre-op DOM (which is exactly the numbering the op's paths assume at receipt
+    // time), so no fetched SSR is needed; insert cannot (its markup only exists after
+    // the compile). No reStampAll here — the live element keeps its pre-op stamp until
+    // the correlated patch re-stamps. A resolve failure throws; the caller catches it
+    // and falls back to the gated path (buffer, wait for the patch).
+    function applyStructureOpOptimistic(op) {
+      if (op.kind === 'remove') {
+        var el = resolveTarget(op.target);
+        if (!el) throw new Error('meno-play: optimistic remove target not found');
+        if (el.parentNode) el.parentNode.removeChild(el);
+      } else if (op.kind === 'move') {
+        var mvEl = resolveTarget(op.from);
+        if (!mvEl) throw new Error('meno-play: optimistic move source not found');
+        var parent = op.toParent ? resolveTarget(op.toParent) : null;
+        placeByAnchor(mvEl, resolveAnchor(op.anchor, parent));
+      } else {
+        throw new Error('meno-play: optimistic apply supports move/remove only');
+      }
+    }
+
     // Resolve + plan the op (NO global stamped-count check: JS clones on real pages
     // inflate the live count vs the SSR fetch, which would bail EVERY structural edit
     // to a reload). Validation is resolve-success here + the re-stamp shortfall guard
     // after the mutation — both throw → reload, never a half-applied page.
-    function applyStructureOp(nextDoc, op) {
+    function applyStructureOp(nextDoc, op, alreadyApplied) {
       if (!op || !op.kind) throw new Error('meno-play: malformed structure op');
+      // Already applied optimistically on receipt (move/remove): live is in post-op
+      // shape, so re-running the mutation would double-apply. Only re-stamp from the
+      // fetched SSR — the same reStamp the gated path runs after its own mutation, and
+      // its shortfall guard still throws → reload if the optimistic shape diverged.
+      if (alreadyApplied) {
+        runStructureMutation(function () {
+          reStampAll(nextDoc);
+        });
+        return;
+      }
       var mutate;
       if (op.kind === 'remove') {
         var rmEl = resolveTarget(op.target);
@@ -1608,7 +1803,10 @@ export const PATCH_JS = `
     }
 
     // ---- entry point ----------------------------------------------------------
-    function applyPatch(nextDoc, kinds, staleTokens, sheets, op) {
+    // op is the buffered structural op for a 'structure' patch (null otherwise);
+    // alreadyApplied means a move/remove was already mutated into the live DOM
+    // optimistically on receipt, so this patch only re-stamps it (no re-mutate).
+    function applyPatch(nextDoc, kinds, staleTokens, sheets, op, alreadyApplied) {
       // Clear optimistic inline previews FIRST: this patch carries the server's
       // authoritative styling (rebuilt utility sheet + define:vars inline), and
       // a lingering optimistic inline (specificity 1,0,0,0) would shadow it and
@@ -1646,7 +1844,7 @@ export const PATCH_JS = `
         if (!op) throw new Error('meno-play: structure patch without an op');
         syncSheets(nextDoc);
         applyPayloadSheets(sheets);
-        applyStructureOp(nextDoc, op);
+        applyStructureOp(nextDoc, op, alreadyApplied);
         return;
       }
       if (doStyle) {
@@ -1728,7 +1926,7 @@ ${PATCH_JS}
       }
       opQueue = [];
       if (fresh.length !== 1) throw new Error('meno-play: structure op count ' + fresh.length + ' (need exactly 1)');
-      return fresh[0].op;
+      return fresh[0]; // { op, ts, applied } — applied tells applyPatch to re-stamp only
     }
 
     // Opt-in diagnostics — flip WITHOUT any server/app change: in the preview
@@ -1772,8 +1970,15 @@ ${PATCH_JS}
         .then(function (html) {
           var nextDoc = new DOMParser().parseFromString(html, 'text/html');
           // A 'structure' patch needs the editor's exact op (exactly one buffered).
-          var op = batch.kinds.indexOf('structure') !== -1 ? takeStructureOp() : null;
-          applyPatch(nextDoc, batch.kinds, batch.stale, batch.sheets, op);
+          var opEntry = batch.kinds.indexOf('structure') !== -1 ? takeStructureOp() : null;
+          applyPatch(
+            nextDoc,
+            batch.kinds,
+            batch.stale,
+            batch.sheets,
+            opEntry ? opEntry.op : null,
+            opEntry ? opEntry.applied : false,
+          );
           inflight = false;
           if (queued) { queued = false; refresh(); }
         })
@@ -1825,6 +2030,30 @@ ${PATCH_JS}
       );
     });
 
+    // Optimistic plain-text preview (window.postMessage, any origin — same
+    // rationale as the style preview above; resolveTarget validates the path/chain
+    // and applyTextPreview only writes a single direct-child text node's value,
+    // overwritten by the next real 'text' patch).
+    window.addEventListener('message', function (ev) {
+      var d = ev && ev.data;
+      if (!d || d.type !== '${PLAY_TEXT_PREVIEW_EVENT}') return;
+      var t = d.target;
+      if (!t || typeof d.text !== 'string') return;
+      var chain = [];
+      if (Object.prototype.toString.call(t.chain) === '[object Array]') {
+        for (var i = 0; i < t.chain.length; i++) chain.push(String(t.chain[i]));
+      }
+      applyTextPreview(
+        {
+          chain: chain,
+          path: typeof t.path === 'string' ? t.path : '',
+          item: typeof t.item === 'string' ? t.item : '',
+          isComponent: !!t.isComponent,
+        },
+        d.text,
+      );
+    });
+
     // Optimistic CSS-variable preview (window.postMessage, any origin — same
     // rationale as above; applyVarsPreview sanitizes names + values, so a global
     // :root override can't inject arbitrary CSS or break out of the declaration).
@@ -1848,14 +2077,30 @@ ${PATCH_JS}
     // origin — same rationale as the previews above; resolveTarget further validates
     // each id's path/chain before any DOM change, and takeStructureOp requires
     // exactly one buffered op per 'structure' patch). Buffered until the server's
-    // 'structure' patch signal lands.
+    // 'structure' patch signal lands; move/remove are ALSO applied optimistically to
+    // the live DOM right here so the edit shows before the recompile completes.
     window.addEventListener('message', function (ev) {
       var d = ev && ev.data;
       if (!d || d.type !== '${PLAY_STRUCTURE_OP_EVENT}') return;
       var op = d.op;
       if (!op || (op.kind !== 'insert' && op.kind !== 'remove' && op.kind !== 'move')) return;
       var now = (typeof Date !== 'undefined' && Date.now) ? Date.now() : 0;
-      opQueue.push({ op: op, ts: now });
+      // Optimistic pre-patch apply: move/remove only (insert needs server markup);
+      // only when nothing is mid-flight, so the exactly-one-op-per-patch invariant and
+      // the pre-op stamp numbering both still hold. A second op arriving before the
+      // first reconciles buffers WITHOUT applying → takeStructureOp sees > 1 → reload,
+      // exactly as today. Any resolve failure falls back to the gated path.
+      var applied = false;
+      if ((op.kind === 'move' || op.kind === 'remove') && opQueue.length === 0 && !inflight) {
+        try {
+          applyStructureOpOptimistic(op);
+          applied = true;
+        } catch (e) {
+          applied = false;
+          dbg('optimistic structure-op skipped:', (e && e.message) || e);
+        }
+      }
+      opQueue.push({ op: op, ts: now, applied: applied });
     });
 
     // Preserve scroll position across the full reloads that still happen (script /

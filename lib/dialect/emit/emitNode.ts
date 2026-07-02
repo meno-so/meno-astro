@@ -947,13 +947,17 @@ function emitTextChild(text: string, ctx: EmitContext, forceExpr = false): strin
   const safeRaw = !forceExpr && text.length > 0 && text === text.trim() && !/[{}<>\n\r]/.test(text);
   if (safeRaw) return text;
   const literal = JSON.stringify(text);
-  // Astro-compiler workaround: a text-expression string literal ENDING in a newline escape
-  // (`{"…\n"}`), when the next sibling is an element with element children, miscompiles — the
-  // compiler closes the render template early and emits a dangling `$$render\``, surfacing as
-  // `Expected "}"`. Padding the braces (`{ "…\n" }`) so the literal doesn't abut `}` dodges it;
-  // the parser trims the expression inner, so the text round-trips unchanged. (Webflow paragraph
-  // /excerpt text carries trailing newlines, which is where this bites.)
-  return /[\n\r]$/.test(text) ? `{ ${literal} }` : `{${literal}}`;
+  // Astro-compiler workaround: when a text-expression string literal ends in a JSON-ESCAPED
+  // character — a trailing newline (`{"…\n"}`), a closing double-quote (`{"…\""}`), or a tab/
+  // carriage-return/backslash — the escape sequence abuts the closing `}` (as `\n"}` / `\""}`),
+  // and when the next sibling is an element with children the compiler desyncs: it closes the
+  // render template early and emits a dangling `$$render\``, surfacing as `Expected "}"`. Padding
+  // the braces (`{ "…" }`) so the literal doesn't abut `}` dodges it; the parser trims the
+  // expression inner, so the text round-trips unchanged. (Webflow paragraph/excerpt text ends in
+  // a newline or a quote — e.g. a sentence closing with a "quoted" term — which is where it bites.)
+  const lastChar = text.slice(-1);
+  const trailingEscape = lastChar.length > 0 && JSON.stringify(lastChar).length > 3;
+  return trailingEscape ? `{ ${literal} }` : `{${literal}}`;
 }
 
 /** Render a children value (string | array) to an array of column-0 child blocks. */
