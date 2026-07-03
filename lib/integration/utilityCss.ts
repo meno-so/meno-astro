@@ -17,6 +17,7 @@ import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from '../dialect';
 import { isStateVariantClass, generateStateVariantCss, interactiveToTokens } from '../dialect/interactiveVariants';
+import { variantClassFor } from '../dialect/variantClass';
 import {
   responsiveStylesToClasses,
   generateUtilityCSS,
@@ -56,7 +57,8 @@ function eachBpStyle(style: unknown): Array<[string, StyleObject]> {
 function collectClasses(style: unknown, into: Set<string>): void {
   for (const [bp, bpStyle] of eachBpStyle(style)) {
     for (const [prop, value] of Object.entries(bpStyle)) {
-      const candidates = isStyleMapping(value)
+      const isMapping = isStyleMapping(value);
+      const candidates = isMapping
         ? Object.values((value as { values?: Record<string, unknown> }).values ?? {})
         : [value];
       for (const v of candidates) {
@@ -76,6 +78,15 @@ function collectClasses(style: unknown, into: Set<string>): void {
         }
         const single = (bp === 'base' ? { [prop]: v } : { [bp]: { [prop]: v } }) as StyleValue;
         for (const c of responsiveStylesToClasses(single)) into.add(c);
+        // A `_mapping` on this prop emits the class form as a `variants()` TABLE, whose color
+        // var-token values keep the self-describing shorthand (`bg-(--accent)`) rather than the bare
+        // token (`bg-accent`) the static engine above produces — so ALSO collect `variantClassFor`,
+        // the exact class the runtime table renders. Without it a converted color-mapping (e.g. a
+        // Button's `version` prop) gets no matching CSS rule and renders unstyled.
+        if (isMapping) {
+          const variantCls = variantClassFor(prop, v as string | number, bp);
+          if (variantCls) into.add(variantCls);
+        }
       }
     }
   }

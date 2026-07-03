@@ -94,3 +94,18 @@ describe('genuine dialect pages are NOT falsely flagged', () => {
     expect(parse(src).unsupported).toBeUndefined();
   });
 });
+
+describe('hand-authored markup after the layout element → read-only (not clobbered)', () => {
+  test('trailing markup after </BaseLayout> is flagged read-only (parseElement stops at the close)', () => {
+    // Content past `</BaseLayout>` is body markup the codec never models — emit only writes a trailing
+    // newline there, so it would be SILENTLY DROPPED on re-emit (and clobbered on save). Must be read-only.
+    const src = `${layout('const meta = { title: "P" };')}<!-- hand-authored trailing note -->\n`;
+    const { unsupported } = parse(src);
+    expect(unsupported).toBeDefined();
+    expect(unsupported?.reason).toContain('after the layout element');
+  });
+
+  test('a clean emitted page (only a trailing newline after the layout) stays editable', () => {
+    expect(parse(layout('const meta = { title: "P" };')).unsupported).toBeUndefined();
+  });
+});

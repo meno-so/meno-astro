@@ -12,9 +12,8 @@
  *                  inside `{ … }`.
  */
 
-import type { ResponsiveStyleObject } from 'meno-core/shared';
-import { singularize, responsiveStylesToClasses, splitVariantPrefix } from 'meno-core/shared';
-import { decodeVariantClass } from '../variantClass';
+import { singularize, splitVariantPrefix } from 'meno-core/shared';
+import { decodeVariantClass, variantClassFor } from '../variantClass';
 import { serializeLiteral } from './serialize';
 import { type EmitContext, needRuntime, needRuntimeComponent } from './emitContext';
 import { hasRawHtmlPrefix, isRichTextHtml, stripMenoSpanMarker, stripRawHtmlPrefix } from '../richtext';
@@ -480,33 +479,6 @@ function serializeExprLiteral(value: unknown): string {
     return entries.length ? `{ ${entries.join(', ')} }` : '{}';
   }
   return 'null';
-}
-
-/** Color CSS prop → its class root, for keeping the `var()` shorthand in variant tables. */
-const VARIANT_COLOR_ROOT: Record<string, string> = {
-  color: 'text',
-  backgroundColor: 'bg',
-  borderColor: 'border',
-  accentColor: 'accent',
-  outlineColor: 'outline',
-};
-
-/** The utility class for a CSS prop+value at a breakpoint (engine form), or undefined. */
-function variantClassFor(cssProp: string, value: string | number, bp: string): string | undefined {
-  if (value === '') return undefined;
-  const responsive: ResponsiveStyleObject = { [bp]: { [cssProp]: value } };
-  const cls = responsiveStylesToClasses(responsive)[0];
-  if (!cls) return cls;
-  // A `var(--token)` color value emits the bare token form (`text-muted`) in the static engine, but
-  // variant TABLES keep the self-describing `var()` shorthand (`text-(--muted)`) so they round-trip
-  // through `decodeVariantClass` without the project token set (the table is parsed/built standalone).
-  const root = VARIANT_COLOR_ROOT[cssProp];
-  const varMatch = typeof value === 'string' ? value.match(/^var\((--[\w-]+)\)$/) : null;
-  if (root && varMatch?.[1]) {
-    const bare = `${root}-${varMatch[1].slice(2)}`;
-    if (cls.endsWith(bare)) return `${cls.slice(0, -bare.length)}${root}-(${varMatch[1]})`;
-  }
-  return cls;
 }
 
 /**

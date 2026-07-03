@@ -116,10 +116,23 @@ function parsePageRoot(body: string, ctx: ParseContext, bodyStart: number): { ro
   const trimmed = body.trim();
   if (!trimmed.startsWith('<')) return {};
   const base = bodyStart + leadingWs(body);
-  const wrapper = parseElement(trimmed, 0, ctx, base).node as Record<string, unknown>;
+  const { node: wrapperNode, end } = parseElement(trimmed, 0, ctx, base);
+  const wrapper = wrapperNode as Record<string, unknown>;
+  // `parseElement` stops at the wrapper's close (`</BaseLayout>`); emit only ever writes a lone
+  // trailing newline after it, so any NON-whitespace content past `end` is hand-authored body
+  // markup the codec doesn't model — it would be SILENTLY DROPPED on re-emit (and CLOBBERED on
+  // save). Report it read-only, same as the multi-root / `_code` cases below.
+  const trailing = trimmed.slice(end).trim();
   const children = wrapper.children;
+  const root = Array.isArray(children) && children.length ? children[0] : undefined;
+  if (trailing.length > 0) {
+    return {
+      root,
+      unsupported:
+        "page body has hand-authored markup after the layout element the editor can't model (it would be lost on save)",
+    };
+  }
   if (!Array.isArray(children) || children.length === 0) return {};
-  const root = children[0];
   if (children.length > 1) {
     return {
       root,
