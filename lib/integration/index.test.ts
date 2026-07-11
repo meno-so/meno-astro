@@ -8,6 +8,8 @@ import meno, {
   LOCALE_MIDDLEWARE_ENTRYPOINT,
   LOCALE_ROUTE_PATTERN,
   LOCALE_ROUTE_ENTRYPOINT,
+  COMPONENT_PREVIEWS_ROUTE,
+  COMPONENT_PREVIEWS_ENTRYPOINT,
   MENO_ASSET_DIRS,
   MENO_PLAY_ENV,
   PLAY_NAVIGATE_MESSAGE_TYPE,
@@ -209,6 +211,46 @@ describe('meno() integration', () => {
     });
 
     expect(routes).toEqual([{ pattern: LOCALE_ROUTE_PATTERN, entrypoint: LOCALE_ROUTE_ENTRYPOINT, prerender: true }]);
+  });
+
+  test('play mode injects the component-previews endpoint; non-play never does', () => {
+    // The Components-tab hover tooltip pre-fetches this endpoint. It's play-only so it
+    // never ships in a deploy build. Single-locale root so the locale route stays out and
+    // the component-previews route is the only injected route to assert on.
+    const root = projectRootWith({
+      defaultLocale: 'en',
+      locales: [{ code: 'en', name: 'English', nativeName: 'English', langTag: 'en-US' }],
+    });
+    const cprev = { pattern: COMPONENT_PREVIEWS_ROUTE, entrypoint: COMPONENT_PREVIEWS_ENTRYPOINT, prerender: false };
+
+    // Non-play: not injected.
+    const nonPlay: unknown[] = [];
+    menoBase().hooks['astro:config:setup']({
+      config: { root: pathToFileURL(`${root}/`) },
+      updateConfig: () => {},
+      addMiddleware: () => {},
+      injectRoute: (r) => nonPlay.push(r),
+    });
+    expect(nonPlay).toEqual([]);
+
+    // Play: injected.
+    const play: unknown[] = [];
+    const prev = process.env[MENO_PLAY_ENV];
+    process.env[MENO_PLAY_ENV] = '1';
+    try {
+      menoBase().hooks['astro:config:setup']({
+        config: { root: pathToFileURL(`${root}/`) },
+        command: 'dev',
+        updateConfig: () => {},
+        addMiddleware: () => {},
+        injectScript: () => {},
+        injectRoute: (r) => play.push(r),
+      });
+    } finally {
+      if (prev === undefined) delete process.env[MENO_PLAY_ENV];
+      else process.env[MENO_PLAY_ENV] = prev;
+    }
+    expect(play).toEqual([cprev]);
   });
 
   test('output: static by default — no `output` forced into the Astro config', () => {
@@ -616,7 +658,7 @@ describe('meno() integration', () => {
         nextCalled = true;
       },
     );
-    expect(headers).toEqual({ [PLAY_MARKER_HEADER]: '1' });
+    expect(headers).toEqual({ [PLAY_MARKER_HEADER]: '1', 'Access-Control-Allow-Origin': '*' });
     expect(nextCalled).toBe(true);
 
     // The preview-server hook mirrors the dev one (best-effort coverage).

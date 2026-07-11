@@ -15,7 +15,7 @@ import {
   scanString,
   scanTemplate,
 } from './scan';
-import { parseLiteral } from './parseLiteral';
+import { parseLiteral, reversePropListGuard } from './parseLiteral';
 import { interpretExprValue, interpretClassExpr, reverseCondition } from './parseValue';
 import { callArgsOf } from './callArgs';
 import { hasStyleContent, normalizeNode } from '../normalize';
@@ -348,6 +348,17 @@ function unwrapMapFragment(children: Child[]): Child[] {
   return children;
 }
 
+/**
+ * Record that the body consumes data binding `name` as a list source, so the frontmatter
+ * passthrough extractor keeps that `getCollectionList`/`getRemoteData`/`getSanityData` const
+ * OUT of the verbatim block (emit regenerates it from the list node). Skipped during the
+ * round-trip gate's transient re-parse — a candidate marked consumed there has no real body
+ * list node, so it would be covered-but-never-regenerated (the very drop this guards against).
+ */
+function markBindingConsumed(ctx: ParseContext, name: string): void {
+  if (name && !ctx._expressionListReparse) ctx.consumedDataBindings?.add(name);
+}
+
 function parseMapExpr(e: string, ctx: ParseContext, base = 0): Node {
   const mapIdx = e.indexOf('.map(');
   const head = e.slice(0, mapIdx).trim();
@@ -376,10 +387,13 @@ function parseMapExpr(e: string, ctx: ParseContext, base = 0): Node {
     const inner = callArgsOf(head);
     const parts = splitTopLevel(inner, ',').filter(Boolean);
     const opts = parts[1] ? (parseLiteral(parts[1]) as Record<string, unknown>) : {};
+    // Unwrap the undeclared-source build guard back to the bare identifier so it round-trips
+    // (emit re-adds it while the prop stays out of scope). See guardUnscopedPropSource.
+    const source = reversePropListGuard(parts[0] ?? '') ?? parts[0];
     const node: Node = {
       type: 'list',
       sourceType: 'prop',
-      source: `{{${parts[0]}}}`,
+      source: `{{${source}}}`,
       ...opts,
       children,
     };
@@ -394,6 +408,7 @@ function parseMapExpr(e: string, ctx: ParseContext, base = 0): Node {
     const parts = splitTopLevel(callArgsOf(head), ',').map((s) => s.trim());
     const firstArg = parts[0] ?? '';
     const binding = ctx.collectionBindings.get(firstArg);
+    if (binding) markBindingConsumed(ctx, firstArg);
     const source = binding?.source ?? firstArg;
     const query = parts[1] ? (parseLiteral(parts[1]) as Record<string, unknown>) : {};
     const node: Node = {
@@ -409,6 +424,7 @@ function parseMapExpr(e: string, ctx: ParseContext, base = 0): Node {
 
   const remote = ctx.remoteBindings.get(head);
   if (remote) {
+    markBindingConsumed(ctx, head);
     // Remote-data list: the binding carries the URL + query (path/filter/sort/limit/offset).
     const node: Node = {
       type: 'list',
@@ -423,6 +439,7 @@ function parseMapExpr(e: string, ctx: ParseContext, base = 0): Node {
 
   const sanity = ctx.sanityBindings.get(head);
   if (sanity) {
+    markBindingConsumed(ctx, head);
     // Sanity GROQ list: the binding carries the document type + query (filter/sort/limit/offset).
     const node: Node = {
       type: 'list',
@@ -447,6 +464,7 @@ function parseMapExpr(e: string, ctx: ParseContext, base = 0): Node {
   }
 
   const binding = ctx.collectionBindings.get(head);
+  if (binding) markBindingConsumed(ctx, head);
   const source = binding?.source ?? head;
   const node: Node = {
     type: 'list',
@@ -655,6 +673,21 @@ function otherAttrs(attrs: Attr[], ctx: ParseContext, skip: Set<string>): Record
   return out;
 }
 
+/**
+ * A sole i18n-value child (`[{ _i18n: true, … }]`) collapses to the bare object — the DIRECT
+ * `children: { _i18n }` shape the editor writes (i18nToggle/ChildrenSection) and meno-core
+ * resolves (ComponentBuilder/ssrRenderer treat an i18n object anywhere `children` is accepted).
+ * The dialect emits it inline as `<h1>{i18n({…})}</h1>`, which parses back to a single-element
+ * array; without this collapse the sidebar children editor + the i18n globe toggle (both only
+ * recognize the direct form) wouldn't see it and the layers tree would label it "Object". Mixed
+ * children (`['Hi ', {_i18n}, '!']`) keep the array — each i18n element still round-trips as its
+ * own `{i18n({…})}` child (see emitChildrenList / renderNode's i18n branch). */
+function finalizeChildren(children: Child[]): Child | Child[] {
+  const only = children.length === 1 ? children[0] : undefined;
+  if (only && typeof only === 'object' && (only as Record<string, unknown>)._i18n === true) return only;
+  return children;
+}
+
 function elementToNode(tag: string, attrs: Attr[], children: Child[], ctx: ParseContext): Child | null {
   // Emit-derived inline CMS-data script for a filter-wired collection list
   // (`<script type="application/json" id="meno-cms-<collection>" … set:html={serializeClientCmsData(…)}>`)
@@ -684,7 +717,7 @@ function elementToNode(tag: string, attrs: Attr[], children: Child[], ctx: Parse
     const attributes = otherAttrs(attrs, ctx, new Set(['class', 'style']));
     landStaticClass(attributes, extraClass);
     if (Object.keys(attributes).length) node.attributes = attributes;
-    if (children.length) node.children = children;
+    if (children.length) node.children = finalizeChildren(children);
     return node;
   }
 
@@ -714,7 +747,7 @@ function elementToNode(tag: string, attrs: Attr[], children: Child[], ctx: Parse
       node.href = lh.href;
     }
     if (Object.keys(rest).length) node.attributes = rest;
-    if (children.length) node.children = children;
+    if (children.length) node.children = finalizeChildren(children);
     return node;
   }
 
@@ -806,7 +839,7 @@ function elementToNode(tag: string, attrs: Attr[], children: Child[], ctx: Parse
       }
     }
     if (Object.keys(props).length) node.props = props;
-    if (children.length) node.children = children;
+    if (children.length) node.children = finalizeChildren(children);
     return node;
   }
 
@@ -819,7 +852,7 @@ function elementToNode(tag: string, attrs: Attr[], children: Child[], ctx: Parse
     const props: Record<string, unknown> = {};
     for (const a of attrs) props[a.name] = attrValue(a, ctx);
     if (Object.keys(props).length) node.props = props;
-    if (children.length) node.children = children;
+    if (children.length) node.children = finalizeChildren(children);
     return node;
   }
 
@@ -834,7 +867,7 @@ function elementToNode(tag: string, attrs: Attr[], children: Child[], ctx: Parse
     const props = otherAttrs(attrs, ctx, new Set(['class', 'style']));
     landStaticClass(props, extraClass);
     if (Object.keys(props).length) node.props = props;
-    if (children.length) node.children = children;
+    if (children.length) node.children = finalizeChildren(children);
     return node;
   }
 
@@ -844,6 +877,6 @@ function elementToNode(tag: string, attrs: Attr[], children: Child[], ctx: Parse
   const attributes = otherAttrs(attrs, ctx, new Set(['class', 'style']));
   landStaticClass(attributes, extraClass);
   if (Object.keys(attributes).length) node.attributes = attributes;
-  if (children.length) node.children = children;
+  if (children.length) node.children = finalizeChildren(children);
   return node;
 }

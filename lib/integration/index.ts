@@ -184,6 +184,16 @@ export const LOCALE_ROUTE_PATTERN = '/[locale]/[...path]';
 export const LOCALE_ROUTE_ENTRYPOINT = 'meno-astro/components/LocaleRoute.astro';
 
 /**
+ * The play-only component-previews endpoint: real-Astro-rendered HTML for every project
+ * component, consumed by the editor's Components-tab hover tooltip (see
+ * `runtime/componentPreviews.ts`). Injected ONLY in play mode, so it never appears in a
+ * deploy build. The pattern ends in `.json` so Astro treats it as a static-file-style
+ * route (no trailing-slash normalization) and it never collides with a project page.
+ */
+export const COMPONENT_PREVIEWS_ROUTE = '/__meno/component-previews.json';
+export const COMPONENT_PREVIEWS_ENTRYPOINT = 'meno-astro/runtime/componentPreviews';
+
+/**
  * Resolve a project root from the integration's `config.root` (a file:// URL or a path
  * string), falling back to `process.cwd()`. Kept tiny + defensive: any oddity degrades to
  * cwd, which is the Astro project dir during build.
@@ -627,6 +637,11 @@ function playMarkerVitePlugin(): Record<string, unknown> {
   const stamp = (server: MarkableServer) => {
     server.middlewares.use((_req, res, next) => {
       res.setHeader(PLAY_MARKER_HEADER, '1');
+      // Permissive CORS on every play response (dev-only, localhost): the editor fetches
+      // the component-previews endpoint cross-origin, and the Components-tab preview iframe
+      // loads the project's @font-face files cross-origin (font fetches are CORS-mode, so
+      // they'd otherwise fail). Images need no CORS but are covered harmlessly.
+      res.setHeader('Access-Control-Allow-Origin', '*');
       next();
     });
   };
@@ -960,6 +975,18 @@ export default function meno(): IntegrationLike[] {
           // Dev only: the patch bridge that applies style/text patches in
           // place (see ./playPatch) — useless without an HMR socket.
           if (isPlayDev) injectScript('head-inline', PLAY_PATCH_BRIDGE_SCRIPT);
+        }
+
+        // (e) Play mode only: the component-previews endpoint the editor's Components-tab
+        //     hover tooltip pre-fetches — real-Astro-rendered HTML for every project
+        //     component, rendered via the Container API (see runtime/componentPreviews.ts).
+        //     Gated on play so it never ships in a deploy build.
+        if (isPlayMode && injectRoute) {
+          injectRoute({
+            pattern: COMPONENT_PREVIEWS_ROUTE,
+            entrypoint: COMPONENT_PREVIEWS_ENTRYPOINT,
+            prerender: false,
+          });
         }
       },
 

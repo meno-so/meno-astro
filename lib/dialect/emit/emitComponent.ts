@@ -15,7 +15,13 @@ import { createEmitContext, relativeComponentImport, type EmitOptions } from './
 import { emitNode, collectItemBindings, buildClientDataScripts } from './emitNode';
 import { serializeLiteral } from './serialize';
 import { emitStyleValuesConst } from '../styleValues';
-import { buildImportLines, buildPropsBlock, IS_EDITOR_MODE_CONST, referencesIsEditorMode } from './frontmatter';
+import {
+  buildImportLines,
+  buildPropsBlock,
+  IS_EDITOR_MODE_CONST,
+  recoverPassthroughDataImports,
+  referencesIsEditorMode,
+} from './frontmatter';
 import { collectFrontmatterDeclaredNames } from '../parse/frontmatterScan';
 import { importedLibraryUrls } from '../libraryImports';
 import { wrapDefineVarsJs } from '../scriptBind';
@@ -162,13 +168,29 @@ export function emitComponent(def: StructuredComponentDefinition, opts?: EmitOpt
       .filter(([, d]) => (d as { type?: string })?.type === 'rich-text')
       .map(([name]) => name),
   );
+  // The Extended subset (`editor:'extended'`): those props render through the registry-backed
+  // `richTextWithComponents(prop, cmsComponents)` pass so embedded project components resolve.
+  // A Basic prop (`editor` absent/`'basic'`) renders lean via `richText(prop)` — no registry.
+  // See emitTextChild + EmitContext.richTextExtendedProps.
+  ctx.richTextExtendedProps = new Set(
+    Object.entries(iface ?? {})
+      .filter(
+        ([, d]) =>
+          (d as { type?: string; editor?: string })?.type === 'rich-text' &&
+          (d as { editor?: string }).editor === 'extended',
+      )
+      .map(([name]) => name),
+  );
   // Rich-text fields nested inside a `type:"list"` prop's `itemSchema` (`tabs.itemSchema.title`
   // is rich-text). A `{{tab.title}}` text child inside `list(tabs).map((tab) => …)` must ALSO
   // render via `set:html` — the list-item analog of richTextProps. Keyed by the list prop name
   // (the list node's `source`); renderList activates it for the loop var while emitting children.
+  // The Extended subset per list (`itemSchema` fields with `editor:'extended'`) selects the heavy
+  // render form for `{{itemVar.field}}` bindings; the Basic complement renders lean via `richText(…)`.
   ctx.richTextItemFields = new Map();
+  ctx.richTextItemExtendedFields = new Map();
   for (const [name, d] of Object.entries(iface ?? {})) {
-    const decl = d as { type?: string; itemSchema?: Record<string, { type?: string }> };
+    const decl = d as { type?: string; itemSchema?: Record<string, { type?: string; editor?: string }> };
     if (decl?.type !== 'list' || !decl.itemSchema) continue;
     const fields = new Set(
       Object.entries(decl.itemSchema)
@@ -176,6 +198,12 @@ export function emitComponent(def: StructuredComponentDefinition, opts?: EmitOpt
         .map(([fieldName]) => fieldName),
     );
     if (fields.size) ctx.richTextItemFields.set(name, fields);
+    const extendedFields = new Set(
+      Object.entries(decl.itemSchema)
+        .filter(([, fd]) => fd?.type === 'rich-text' && fd.editor === 'extended')
+        .map(([fieldName]) => fieldName),
+    );
+    if (extendedFields.size) ctx.richTextItemExtendedFields.set(name, extendedFields);
   }
   // CMS-item bindings: identifiers the template references (e.g. `cms` in `{{cms.title}}`,
   // or `post` in `{{post.title}}`) that aren't declared props. Computed before the body
@@ -186,7 +214,11 @@ export function emitComponent(def: StructuredComponentDefinition, opts?: EmitOpt
   // …`). Subtract them from the props-derived ambient bindings so emit never writes a SECOND
   // `const next` (a duplicate declaration that breaks `astro build`). The body reference
   // resolves to the passthrough const instead. See collectFrontmatterDeclaredNames.
-  const passthroughNames = collectFrontmatterDeclaredNames((def as { _frontmatter?: string })._frontmatter);
+  const passthroughSource = (def as { _frontmatter?: string })._frontmatter;
+  const passthroughNames = collectFrontmatterDeclaredNames(passthroughSource);
+  // An orphaned `getCollectionList`/`getRemoteData`/`getSanityData` binding kept verbatim in
+  // `_frontmatter` still needs its helper imports — the body walk below never registers them.
+  recoverPassthroughDataImports(ctx, passthroughSource);
   const itemBindings = collectItemBindings(def.structure, [...Object.keys(iface ?? {}), ...passthroughNames]);
   if (itemBindings.includes('cms')) {
     ctx.cmsInScope = true;
@@ -194,11 +226,13 @@ export function emitComponent(def: StructuredComponentDefinition, opts?: EmitOpt
     // own `{{cms.*}}` templates need the same i18n() wrap as the page body (emitPage).
     ctx.i18nRoots.add('cms');
     // A shared component has no CMS schema of its own; the converter passes the project-wide
-    // union of rich-text field names so a `{{cms.<field>}}` text child emits via
-    // `set:html={richTextWithComponents(cms.<field>, cmsComponents)}` (not the object-coercing
-    // `{i18n(cms.<field>)}`). The analog of emitPage's per-page `cmsRichTextFields`.
-    // See emitTextChild / EmitOptions.
+    // union of rich-text field names so a `{{cms.<field>}}` text child emits as HTML via
+    // `set:html={…}` (not the object-coercing `{i18n(cms.<field>)}`). The render form is tiered by
+    // the Extended union (`cmsRichTextExtendedFields`, a field Extended in ANY collection): Extended
+    // → `richTextWithComponents(cms.<field>, cmsComponents)`; Basic → lean `richText(cms.<field>)`.
+    // The analog of emitPage's per-page split. See emitTextChild / EmitOptions.
     if (opts?.cmsRichTextFields) ctx.cmsRichTextFields = opts.cmsRichTextFields;
+    if (opts?.cmsRichTextExtendedFields) ctx.cmsRichTextExtendedFields = opts.cmsRichTextExtendedFields;
   }
   // The structure root's class attr is marked `root: true` so the runtime style() merges
   // the instance class the parent passed (`__props.class`) over the root's own classes —
@@ -304,10 +338,9 @@ export function emitComponent(def: StructuredComponentDefinition, opts?: EmitOpt
   // happens (the passthrough is the author's original code, predating any emit-generated const).
   // Ordering the other way is a temporal-dead-zone ReferenceError at SSR. Re-captured
   // identically on parse (position-independent), so it round-trips.
-  const passthrough = (def as { _frontmatter?: string })._frontmatter;
-  if (typeof passthrough === 'string' && passthrough.trim()) {
+  if (typeof passthroughSource === 'string' && passthroughSource.trim()) {
     fm.push('');
-    fm.push(passthrough.trim());
+    fm.push(passthroughSource.trim());
   }
   if (ctx.frontmatterConsts.length) {
     fm.push('');

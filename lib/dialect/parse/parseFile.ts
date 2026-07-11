@@ -193,10 +193,22 @@ export function parseFile(source: string, opts: ParseFileOptions = {}): ParsedFi
   source = source.replace(/\r\n/g, '\n');
   const { code, body, bodyStart, codeStart } = splitFrontmatter(source);
   const front = parseFrontmatter(code);
+  const spans = opts.collectSpans ? new Map<object, NodeSpan>() : undefined;
+  if (spans) front.ctx.spans = spans;
+
+  // Parse the body BEFORE extracting the frontmatter passthrough: the body walk records which
+  // `getCollectionList`/`getRemoteData`/`getSanityData` bindings it consumes as a list source
+  // (front.ctx.consumedDataBindings). The passthrough extractor needs that so an ORPHANED data
+  // binding — declared in frontmatter but only used by hand-authored code mapping over a DERIVED
+  // var — stays in the verbatim block instead of being dropped on the next emit (a dangling
+  // reference that breaks the build). See extractFrontmatterPassthrough / parseContext.
+  const componentBody = front.kind === 'component' ? splitComponentBody(body, front.ctx, bodyStart) : undefined;
+  const pageBody = front.kind === 'page' ? parsePageRoot(body, front.ctx, bodyStart) : undefined;
+
   // Hand-authored frontmatter the codec doesn't model (foreign imports, helper consts,
   // `import.meta.env`, …) is CAPTURED verbatim as `_frontmatter` so the file round-trips.
   // Only a frontmatter that can't be scanned at all (unterminated literal) is `unsupported`.
-  const passthrough = extractFrontmatterPassthrough(code);
+  const passthrough = extractFrontmatterPassthrough(code, front.ctx.consumedDataBindings);
   const unsupported =
     passthrough && 'unparseable' in passthrough
       ? { reason: 'unparseable frontmatter (unterminated string or template)' }
@@ -206,11 +218,9 @@ export function parseFile(source: string, opts: ParseFileOptions = {}): ParsedFi
     opts.collectSpans && passthrough && 'spans' in passthrough
       ? passthrough.spans.map((s) => ({ start: s.start + codeStart, end: s.end + codeStart }))
       : undefined;
-  const spans = opts.collectSpans ? new Map<object, NodeSpan>() : undefined;
-  if (spans) front.ctx.spans = spans;
 
   if (front.kind === 'component') {
-    const { structure, css, javascript, defineVars } = splitComponentBody(body, front.ctx, bodyStart);
+    const { structure, css, javascript, defineVars } = componentBody!;
     const def: Record<string, unknown> = {};
     if (front.propsInterface && Object.keys(front.propsInterface).length) {
       def.interface = front.propsInterface;
@@ -226,7 +236,7 @@ export function parseFile(source: string, opts: ParseFileOptions = {}): ParsedFi
     return { model: { component: def }, spans, frontmatterRegions, unsupported };
   }
 
-  const { root, unsupported: bodyReason } = parsePageRoot(body, front.ctx, bodyStart);
+  const { root, unsupported: bodyReason } = pageBody!;
   const page: Record<string, unknown> = {};
   if (front.meta !== undefined) page.meta = front.meta;
   if (root !== undefined) page.root = root;

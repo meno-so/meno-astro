@@ -142,6 +142,18 @@ export function reverseDeadCmsGuard(expr: string): string | null {
   return m ? (m[1] ?? null) : null;
 }
 
+/**
+ * Reverse the undeclared-prop-source guard the emitter wraps an out-of-scope bare-identifier
+ * prop-list source in (`list(typeof items === 'undefined' ? [] : items).map(…)`): the guard
+ * `typeof items === 'undefined' ? [] : items` → the bare identifier `items`. Null for anything
+ * else. The `\1` backreference (the same identifier on both sides) keeps it from matching
+ * authored JS. See `guardUnscopedPropSource` in emitNode.
+ */
+export function reversePropListGuard(expr: string): string | null {
+  const m = expr.trim().match(/^typeof ([A-Za-z_$][\w$]*) === 'undefined' \? \[\] : \1$/);
+  return m ? (m[1] ?? null) : null;
+}
+
 /** Reverse a backtick template-literal body to a `{{…}}` template string. Mirrors the
  *  emitter's `escapeBacktick` + `${expr}` interpolation (the inverse of `templateToExpr`),
  *  including the CMS-data wrap (`${i18n(cms.x)}` → `{{cms.x}}`). */

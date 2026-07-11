@@ -16,7 +16,12 @@ import type { JSONPage } from 'meno-core/shared';
 import { createEmitContext, needRuntime, needRuntimeComponent, type EmitOptions } from './emitContext';
 import { emitNode, buildClientDataScripts, hasTemplate, templateToExpr } from './emitNode';
 import { serializeLiteral, rawExpr } from './serialize';
-import { buildImportLines, IS_EDITOR_MODE_CONST, referencesIsEditorMode } from './frontmatter';
+import {
+  buildImportLines,
+  IS_EDITOR_MODE_CONST,
+  recoverPassthroughDataImports,
+  referencesIsEditorMode,
+} from './frontmatter';
 import { emitStyleValuesConst } from '../styleValues';
 import { importedLibraryUrls } from '../libraryImports';
 import { isCmsTemplatePage, buildGetStaticPaths, cmsRouteDirFromUrlPattern, type CmsMetaLike } from '../cmsRoute';
@@ -54,14 +59,25 @@ export function emitPage(page: JSONPage, opts?: EmitOptions): string {
   if (isCms) {
     ctx.cmsInScope = true;
     ctx.i18nRoots.add('cms');
-    // Rich-text fields render via `set:html={richTextWithComponents(cms.field, cmsComponents)}`
-    // (not text interpolation), so a `{{cms.<field>}}` body binding shows HTML instead of
-    // "[object Object]". Mirrors emitComponent's richTextProps, but reads the CMS schema.
-    // See emitTextChild.
+    // Rich-text fields render as HTML via `set:html={…}` (not text interpolation), so a
+    // `{{cms.<field>}}` body binding shows HTML instead of "[object Object]". The render FORM is
+    // tiered by each field's `editor` meta (Basic → `richText(cms.field)`; Extended →
+    // `richTextWithComponents(cms.field, cmsComponents)`). emitPage reads the page's OWN schema, so
+    // the Basic/Extended split is exact here (no union ambiguity — that only affects shared
+    // components). Mirrors emitComponent's richTextProps/richTextExtendedProps. See emitTextChild.
     const fields = (page.meta as { cms?: CmsMetaLike }).cms?.fields ?? {};
     ctx.cmsRichTextFields = new Set(
       Object.entries(fields)
         .filter(([, d]) => (d as { type?: string })?.type === 'rich-text')
+        .map(([name]) => name),
+    );
+    ctx.cmsRichTextExtendedFields = new Set(
+      Object.entries(fields)
+        .filter(
+          ([, d]) =>
+            (d as { type?: string; editor?: string })?.type === 'rich-text' &&
+            (d as { editor?: string }).editor === 'extended',
+        )
         .map(([name]) => name),
     );
   }
@@ -82,6 +98,11 @@ export function emitPage(page: JSONPage, opts?: EmitOptions): string {
   // Define meno-core's `isEditorMode` global (false in the built artifact) when the body
   // references it, else the bare identifier throws at SSR. See emitComponent for the why.
   if (referencesIsEditorMode(body)) ctx.frontmatterConsts.unshift(IS_EDITOR_MODE_CONST);
+  // An orphaned `getCollectionList`/`getRemoteData`/`getSanityData` binding kept verbatim in
+  // `_frontmatter` (consumed only by hand-authored frontmatter code, not a body list node)
+  // still needs its helper imports — the body walk above never registered them. Recover them
+  // before buildImportLines / the astro:content import below.
+  recoverPassthroughDataImports(ctx, (page as { _frontmatter?: string })._frontmatter);
 
   // A CMS template page binds the head fields `meta.title` / `meta.description` to entry data
   // (`{{cms.title}}`). BaseLayout renders `meta.title` straight into `<title>` (only resolving

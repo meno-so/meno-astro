@@ -163,12 +163,22 @@ export function collectFrontmatterDeclaredNames(frontmatter: string | undefined)
 /**
  * Is a `const` whose name is `name` and whose RHS (trimmed) is `rhs` one of the recognized
  * dialect forms? Mirrors the `matchAll` passes in `parseFrontmatter`.
+ *
+ * `consumedDataBindings`, when provided (the passthrough extractor), restricts the
+ * `getCollectionList`/`getRemoteData`/`getSanityData` binding forms to bindings the BODY
+ * actually maps over: emit only regenerates such a const from a body list node, so an ORPHANED
+ * binding (declared but consumed only by hand-authored frontmatter, e.g. `const visible =
+ * providersList.filter(…)` mapping over a DERIVED var) must NOT be covered — leaving it in the
+ * verbatim `_frontmatter` block, where it round-trips with the code that uses it. When absent
+ * (the foreign detector, which has no body model), all three forms stay recognized — they are
+ * in-dialect either way, never "foreign".
  */
-function isRecognizedConst(name: string, rhs: string): boolean {
+function isRecognizedConst(name: string, rhs: string, consumedDataBindings?: Set<string>): boolean {
   if (rhs.startsWith('`')) return true; // backtick template const (embed / Tag_N / hand-authored)
-  if (rhs.startsWith(GET_COLLECTION_LIST)) return true; // collection-list binding
-  if (rhs.startsWith(GET_REMOTE_DATA)) return true; // remote-data list binding
-  if (rhs.startsWith(GET_SANITY_DATA)) return true; // sanity-data list binding
+  if (rhs.startsWith(GET_COLLECTION_LIST) || rhs.startsWith(GET_REMOTE_DATA) || rhs.startsWith(GET_SANITY_DATA)) {
+    // Data-source binding — covered (emit regenerates) only when the body consumes it.
+    return !consumedDataBindings || consumedDataBindings.has(name);
+  }
   if (rhs.startsWith(RESOLVE_PROPS)) return true; // `const __props = resolveProps(Astro, {…})`
   if (name === 'meta' || name === '__meno') return true; // page/component meta literals
   if (name === '__styleValues') return true; // emit-only durable hash-fallback value side-channel
@@ -215,6 +225,14 @@ export interface CoverOptions {
    * only emit-regenerated imports are covered, so a foreign import stays captured.
    */
   coverAllImports: boolean;
+  /**
+   * Names of `getCollectionList`/`getRemoteData`/`getSanityData` bindings the body consumes as
+   * a list source. When provided (the passthrough extractor), an ORPHANED data binding — one
+   * declared in frontmatter but not in this set — is left UNCOVERED so it round-trips as
+   * `_frontmatter` (emit would otherwise drop it, see isRecognizedConst). When absent (the
+   * foreign detector), all data bindings stay covered.
+   */
+  consumedDataBindings?: Set<string>;
 }
 
 /**
@@ -292,7 +310,7 @@ export function computeCover(raw: string, opts: CoverOptions): CoverResult {
       const afterName = skipWs(code, afterConst + name.length);
       if (code[afterName] !== '=') continue; // e.g. `const x: T = …` (typed) → leave foreign
       rhsStart = skipWs(code, afterName + 1);
-      recognized = isRecognizedConst(name, code.slice(rhsStart).trimStart());
+      recognized = isRecognizedConst(name, code.slice(rhsStart).trimStart(), opts.consumedDataBindings);
     }
     if (recognized) {
       try {
@@ -320,15 +338,20 @@ export function computeCover(raw: string, opts: CoverOptions): CoverResult {
  * the maximal uncovered, non-whitespace runs and join them with newlines. Re-emitting that
  * block and re-parsing yields the same block (the block is contiguous foreign code on the way
  * back in), so the round-trip is byte-stable and idempotent.
+ *
+ * `consumedDataBindings` (the names the body maps over) keeps an ORPHANED `getCollectionList`/
+ * `getRemoteData`/`getSanityData` const — one no body list node regenerates — inside the
+ * captured block instead of dropping it (see isRecognizedConst / CoverOptions).
  */
 export function extractFrontmatterPassthrough(
   raw: string,
+  consumedDataBindings?: Set<string>,
 ): { block: string; spans: NodeSpan[] } | { unparseable: true } | null {
   if (!raw?.trim()) return null;
 
   let cover: CoverResult;
   try {
-    cover = computeCover(raw, { coverAllImports: false });
+    cover = computeCover(raw, { coverAllImports: false, consumedDataBindings });
   } catch {
     return { unparseable: true };
   }

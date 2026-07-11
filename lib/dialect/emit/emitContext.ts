@@ -145,42 +145,74 @@ export interface EmitContext {
   propsVar?: string;
   /**
    * Names of props declared `type:"rich-text"` in this component's interface. A text child
-   * that is a bare ref to one of these (`{{text}}`) renders as real HTML via
-   * `<Fragment set:html={text} />` — a plain `{text}` would HTML-escape the markup and the
-   * inline marks (spans/strong/links) would die. Set by emitComponent before the body walk;
-   * undefined on pages (which have no prop interface).
+   * that is a bare ref to one of these (`{{text}}`) renders as real HTML via `<Fragment
+   * set:html={…} />` — a plain `{text}` would HTML-escape the markup and the inline marks
+   * (spans/strong/links) would die. The RENDER FORM is tiered by the prop's `editor` meta
+   * (see `richTextExtendedProps`): Basic (`editor` absent/`'basic'`) → `set:html={richText(text)}`
+   * (lean; no component registry); Extended (`editor:'extended'`) → `set:html={richTextWithComponents(text,
+   * cmsComponents)}` (imports the registry so embedded project components render). Set by
+   * emitComponent before the body walk; undefined on pages (which have no prop interface).
    */
   richTextProps?: Set<string>;
+  /**
+   * Subset of `richTextProps` whose `editor` meta is `'extended'`. A member of this set renders
+   * through the registry-backed `richTextWithComponents(prop, cmsComponents)` pass (so a component
+   * embedded in the rich-text value renders); the Basic complement renders lean via `richText(prop)`
+   * and imports no registry. Set by emitComponent alongside `richTextProps`.
+   */
+  richTextExtendedProps?: Set<string>;
   /**
    * For each `type:"list"` prop, the names of its `itemSchema` fields declared
    * `type:"rich-text"`. Keyed by the LIST prop name (the list's `source`). A text child that
    * is a member ref to one (`{{tab.title}}` inside `list(tabs).map((tab) => …)`) renders as
-   * real HTML via `<Fragment set:html={richTextWithComponents(tab.title, cmsComponents)} />` —
-   * the list-item analog of `richTextProps`, so a rich-text field inside a loop doesn't ship
-   * ESCAPED (`{tab.title}` → literal `<br>`/`<span>`/`<div>` text). Set by emitComponent before
-   * the body walk; consumed via the `richTextLoopFields` stack renderList pushes while it emits
-   * a list's children.
+   * real HTML via `<Fragment set:html={…} />` — the list-item analog of `richTextProps`, so a
+   * rich-text field inside a loop doesn't ship ESCAPED (`{tab.title}` → literal `<br>`/`<span>`/
+   * `<div>` text). The render form is tiered by the item field's `editor` meta (see
+   * `richTextItemExtendedFields`): Basic → `richText(tab.title)`; Extended → `richTextWithComponents(
+   * tab.title, cmsComponents)`. Set by emitComponent before the body walk; consumed via the
+   * `richTextLoopFields` stack renderList pushes while it emits a list's children.
    */
   richTextItemFields?: Map<string, Set<string>>;
   /**
-   * Active loop frames while emitting inside `list(source).map((itemVar) => …)`: the loop var
-   * plus the rich-text `itemSchema` field names of that list (looked up from
-   * `richTextItemFields` by the list's `source`). A stack — nested lists push/pop — read by
-   * emitTextChild to recognize a `{{itemVar.field}}` rich-text member binding. Managed by
-   * renderList around the child emit.
+   * Extended subset of `richTextItemFields`: per list prop, the `itemSchema` rich-text fields whose
+   * `editor` meta is `'extended'`. A `{{itemVar.field}}` binding to such a field renders through the
+   * registry-backed `richTextWithComponents(…, cmsComponents)` pass; the Basic complement renders lean
+   * via `richText(…)`. Set by emitComponent alongside `richTextItemFields`; surfaced per loop frame as
+   * `extendedFields` (renderList).
    */
-  richTextLoopFields?: Array<{ itemVar: string; fields: Set<string> }>;
+  richTextItemExtendedFields?: Map<string, Set<string>>;
+  /**
+   * Active loop frames while emitting inside `list(source).map((itemVar) => …)`: the loop var,
+   * the rich-text `itemSchema` field names of that list (looked up from `richTextItemFields` by
+   * the list's `source`), and the Extended subset of those field names (`extendedFields`, from
+   * `richTextItemExtendedFields`) that select the heavy render form. A stack — nested lists
+   * push/pop — read by emitTextChild to recognize a `{{itemVar.field}}` rich-text member binding
+   * and pick Basic vs Extended. Managed by renderList around the child emit.
+   */
+  richTextLoopFields?: Array<{ itemVar: string; fields: Set<string>; extendedFields: Set<string> }>;
   /**
    * Names of CMS schema fields declared `type:"rich-text"` on a CMS template page
-   * (`meta.cms.fields`). A bare `{{cms.<field>}}` text child for one of these renders via
-   * `<Fragment set:html={richTextWithComponents(cms.<field>, cmsComponents)} />` — the runtime
-   * resolves the raw TipTap object to HTML (a CMS page has no `resolveProps`, so a plain
-   * `{i18n(cms.field)}` would string-coerce the object to "[object Object]") and renders
-   * embedded `menoComponent` nodes against the generated registry. The parser reverses the
-   * call to the `{{…}}` template, so it round-trips. Set by emitPage before the body walk;
-   * undefined outside a CMS template page. (The analog of `richTextProps`, but for CMS page fields.)
+   * (`meta.cms.fields`). A bare `{{cms.<field>}}` text child for one of these renders as REAL
+   * HTML via `<Fragment set:html={…} />` — the runtime resolves the raw TipTap object to HTML (a
+   * CMS page has no `resolveProps`, so a plain `{i18n(cms.field)}` would string-coerce the object
+   * to "[object Object]"). The RENDER FORM is tiered by the field's `editor` meta (see
+   * `cmsRichTextExtendedFields`): Basic → `richText(cms.<field>)` (lean, no registry); Extended →
+   * `richTextWithComponents(cms.<field>, cmsComponents)` (renders embedded `menoComponent` nodes
+   * against the generated registry). The parser reverses both forms to the `{{…}}` template, so it
+   * round-trips. Set by emitPage before the body walk; undefined outside a CMS template page.
+   * (The analog of `richTextProps`, but for CMS page fields.)
    */
   cmsRichTextFields?: Set<string>;
+  /**
+   * Extended subset of `cmsRichTextFields`: CMS rich-text fields whose `editor` meta is `'extended'`.
+   * A `{{cms.<field>}}` binding to such a field (or an `<Embed html={{cms.<field>}} />`) renders
+   * through the registry-backed `richTextWithComponents(…, cmsComponents)` pass; the Basic complement
+   * renders lean via `richText(…)` and imports no registry. On a CMS template page emitPage reads the
+   * page's OWN schema (exact). For a SHARED component it's the project-wide UNION passed via
+   * EmitOptions (a shared component carries no schema): a field name Extended in ANY collection is
+   * treated Extended here (safe — keeps embedded components rendering). See emitTextChild.
+   */
+  cmsRichTextExtendedFields?: Set<string>;
   /**
    * True when the body emitted a `richTextWithComponents(…, cmsComponents)` call (a CMS
    * rich-text field bound as a text child), so the file's frontmatter must import the
@@ -260,6 +292,16 @@ export interface EmitOptions {
    * `meta.cms.fields`; absent for flat/test emit. See EmitContext.cmsRichTextFields.
    */
   cmsRichTextFields?: Set<string>;
+  /**
+   * For component emit: the Extended subset of `cmsRichTextFields` — the project-wide UNION of CMS
+   * field names that are `type:"rich-text"` AND `editor:"extended"` in AT LEAST ONE collection. A
+   * shared component's `{{cms.<field>}}` text child (or `<Embed html={{cms.<field>}} />`) whose field
+   * is in this set renders through `richTextWithComponents(…, cmsComponents)`; the Basic complement
+   * renders lean via `richText(…)`. Union rule: Extended-in-any → Extended (safe — keeps embedded
+   * components rendering). Built by convertProject; absent for flat/test emit.
+   * See EmitContext.cmsRichTextExtendedFields.
+   */
+  cmsRichTextExtendedFields?: Set<string>;
   /**
    * Component name → the ambient identifiers that component's body reads from `Astro.props`
    * (its `collectItemBindings` result, i.e. `{{X}}` templates referencing neither a declared

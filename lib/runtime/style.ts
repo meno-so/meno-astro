@@ -254,6 +254,18 @@ export function computeClassName(
 // Instance-over-root class merge (component structure roots).
 // ---------------------------------------------------------------------------
 
+/** Color class root → its CSS property. A bare color-token class (`bg-accent`) can't be resolved by
+ *  `classToStyle` without the project token set, but its PROPERTY is unambiguous from the root. Mirrors
+ *  meno-core's COLOR_TOKEN_ROOTS/colorTokenProps pairing, inlined so the published runtime needs no new
+ *  meno-core export. */
+const COLOR_ROOT_TO_PROP: Record<string, string> = {
+  text: 'color',
+  bg: 'backgroundColor',
+  border: 'borderColor',
+  accent: 'accentColor',
+  outline: 'outlineColor',
+};
+
 /**
  * Merge key for one utility class: breakpoint prefix + the CSS property the class
  * decodes to (meno-core's `classToStyle` reverse mapper). `null` when the class isn't a
@@ -273,7 +285,21 @@ function classMergeKey(cls: string): string | null {
   if (bp === 'lg') bp = 'tablet';
   else if (bp === 'sm') bp = 'mobile';
   const entry = classToStyle(cls);
-  return entry ? `${bp}|${entry.prop}` : null;
+  if (entry) return `${bp}|${entry.prop}`;
+  // `classToStyle` returns null for a BARE color-token class (`bg-accent`, `text-text`) — the token
+  // needs the project's token set to resolve — so the class would be treated as non-conflicting and
+  // stylesheet order (not the instance) would pick the winner. That's exactly the bug where an
+  // instance's `bg-[var(--gray-200)]` override loses to a component root's `bg-accent`. Recover the
+  // PROPERTY from the color class root so the two share a key and the instance one wins.
+  // (`bg-cover` / `border-solid` etc. aren't Meno-generated — classToStyle returns null because Meno
+  // doesn't support them — so they only appear as foreign classes and are rare on a merged root.)
+  const bareClass = variantMatch ? cls.slice(variantMatch[0].length) : cls;
+  const dash = bareClass.indexOf('-');
+  if (dash > 0) {
+    const prop = COLOR_ROOT_TO_PROP[bareClass.slice(0, dash)];
+    if (prop && /^[a-zA-Z][\w-]*$/.test(bareClass.slice(dash + 1))) return `${bp}|${prop}`;
+  }
+  return null;
 }
 
 /**

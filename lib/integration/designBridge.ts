@@ -168,18 +168,47 @@ if (window.self !== window.top) {
       for (var j = 0; j < VW_VARS.length; j++) root.style.removeProperty(VW_VARS[j]);
     }
 
+    // ---- design-mode scrollbar suppression ----
+    // The frame is auto-sized to the reported content height, so the page is
+    // never meant to scroll inside it. On Windows/Linux the classic
+    // (space-consuming) scrollbar that briefly appears while the parent's
+    // height sync catches up steals ~17px of layout width, which reflows the
+    // content, which re-measures a taller height, which resizes the frame — a
+    // loop that shows as a flickering scrollbar. Removing the root scrollbar
+    // (no layout space, no paint) breaks the loop; macOS overlay scrollbars
+    // take no space, so this is a no-op there.
+    var noScrollbarStyle = null;
+    function hideScrollbar() {
+      if (noScrollbarStyle) return;
+      try {
+        var s = document.createElement('style');
+        s.textContent =
+          'html,body{scrollbar-width:none !important}' +
+          'html::-webkit-scrollbar,body::-webkit-scrollbar{width:0 !important;height:0 !important;display:none !important}';
+        (document.head || document.documentElement).appendChild(s);
+        noScrollbarStyle = s;
+      } catch (e) {}
+    }
+    function showScrollbar() {
+      if (!noScrollbarStyle) return;
+      try { noScrollbarStyle.parentNode && noScrollbarStyle.parentNode.removeChild(noScrollbarStyle); } catch (e) {}
+      noScrollbarStyle = null;
+    }
+
     // ---- design-mode toggle ----
     window.addEventListener('message', function (ev) {
       var d = ev && ev.data;
       if (!d || d.type !== '${PLAY_DESIGN_MODE_MESSAGE_TYPE}') return;
       designMode = !!d.active;
       if (designMode) {
+        hideScrollbar();
         pinViewport(d.vh, d.vw);
         // The editor's height listener may have missed earlier reports (it only
         // consumes them in design mode) — re-report on activation now that the
         // pinned vh has collapsed any 100vh content to its stable extent.
         lastHeight = -1; schedule();
       } else {
+        showScrollbar();
         clearViewport();
       }
     });

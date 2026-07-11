@@ -64,11 +64,12 @@
  * click/hover, targets carry it back, and resolveTarget() picks the matching
  * copy (exact, then SSR-style prefix-lenient, else hidden).
  *
- * Known gaps (accepted for v1): `<Embed>` nodes are not stamped (stamping
- * would force Embed's optional wrapper `<div>` into existence and change the
- * play DOM vs deploy); drilling INTO a specific list copy isn't tracked —
- * while editing a component the borders anchor to the first rendered copy
- * (the editor's navigationHistory cmsItemContext has no bridge counterpart).
+ * Known gaps (accepted for v1): drilling INTO a specific list copy isn't
+ * tracked — while editing a component the borders anchor to the first rendered
+ * copy (the editor's navigationHistory cmsItemContext has no bridge
+ * counterpart). (`<Embed>` nodes ARE now selectable — they ride the
+ * WRAPPABLE_TYPES `<meno-x>` wrapper, which carries the path without forcing
+ * Embed's own optional wrapper `<div>` into existence.)
  */
 
 import { readFileSync } from 'node:fs';
@@ -170,17 +171,20 @@ type Node = Record<string, unknown>;
 const STAMPABLE_TYPES = new Set(['node', 'link']);
 
 /**
- * Node types that are opaque to Meno — an island (`<Counter client:* />`) or a
- * custom `.astro` black box (`<Fancy />`). Their open tag is a *component*
- * invocation, so a spliced `data-element-path` would land on `Astro.props`, not
- * on any DOM element (Astro never forwards unknown attributes to a component's
- * rendered root). They can't forward identity the way Meno components do either
- * (no Meno-controlled root). So instead of stamping their tag we WRAP them in a
- * `display:contents` element that carries the path — a real, click-resolvable
- * DOM ancestor with zero layout footprint. Play-only (serve-time); the on-disk
- * `.astro` and real builds never see it.
+ * Node types that are opaque to Meno — an island (`<Counter client:* />`), a
+ * custom `.astro` black box (`<Fancy />`), or an `<Embed html=… />`. Their open
+ * tag is a *component* invocation, so a spliced `data-element-path` would land on
+ * `Astro.props`, not on any DOM element (Astro never forwards unknown attributes
+ * to a component's rendered root). They can't forward identity the way Meno
+ * components do either (no Meno-controlled root) — and for `<Embed>` a forwarded
+ * attribute is worse than useless: it flips `hasWrapperAttrs`, forcing Embed's
+ * optional wrapper `<div>` into existence so the play DOM diverges from the real
+ * build. So instead of stamping their tag we WRAP them in a `display:contents`
+ * element that carries the path — a real, click-resolvable DOM ancestor with
+ * zero layout footprint that leaves the wrapped node's own markup untouched.
+ * Play-only (serve-time); the on-disk `.astro` and real builds never see it.
  */
-const WRAPPABLE_TYPES = new Set(['island', 'custom']);
+const WRAPPABLE_TYPES = new Set(['island', 'custom', 'embed']);
 
 /** The serve-time wrapper element name for {@link WRAPPABLE_TYPES} nodes. */
 const XRAY_WRAP_TAG = 'meno-x';
@@ -283,8 +287,9 @@ export function stampElementPaths(source: string): string {
             );
           }
         } else if (typeof type === 'string' && WRAPPABLE_TYPES.has(type)) {
-          // Islands / custom `.astro`: can't stamp the component tag, so wrap it
-          // in a path-carrying `display:contents` element (see WRAPPABLE_TYPES).
+          // Islands / custom `.astro` / embeds: can't stamp the component tag, so
+          // wrap it in a path-carrying `display:contents` element (see
+          // WRAPPABLE_TYPES).
           wrapAt(span, key, slotStamp);
         }
       }
@@ -903,6 +908,9 @@ export const RULER_SPACING_JS = `
  * opacity, no label/fill — XRayOverlay's alt-hover style) tracks the exact
  * stamped element under the cursor, drawn bridge-locally with no editor round
  * trip; Alt keydown/keyup re-evaluates it in place for a stationary cursor.
+ * Select mode also forces cursor:default on every element (matching the
+ * same-origin select preview) so the page's text/pointer cursors only show
+ * while browsing in play mode.
  *
  * Inbound messages are accepted from any origin — same rationale as the
  * navigation bridge's `targetOrigin: '*'`: the editor's origin varies
@@ -1045,6 +1053,26 @@ ${RULER_SPACING_JS}
       if (targets.length || altHoverEl) raf = requestAnimationFrame(frame);
     }
 
+    // Select-tool cursor: while elements are being picked the page's own
+    // cursors (text I-beam, link pointer) are noise — force the default arrow
+    // on every element, the same global !important rule the same-origin
+    // select preview applies (client-editor-router). Keyed by id so it
+    // survives / re-injects across soft navigations without duplicating;
+    // browse (play) mode removes it so the page's real cursors show again.
+    function applySelectCursor() {
+      var existing = document.getElementById('meno-select-mode-cursor');
+      if (selectMode) {
+        if (!existing && document.head) {
+          var cursorStyle = document.createElement('style');
+          cursorStyle.id = 'meno-select-mode-cursor';
+          cursorStyle.textContent = '*, *::before, *::after { cursor: default !important; }';
+          document.head.appendChild(cursorStyle);
+        }
+      } else if (existing && existing.parentNode) {
+        existing.parentNode.removeChild(existing);
+      }
+    }
+
     // Recompute the Alt deep-hover preview anchor. Dedup by element identity
     // — copies of a list item are distinct DOM elements, so this is the
     // bridge-local equivalent of the SSR canvas's path+item dedup. A change
@@ -1063,6 +1091,7 @@ ${RULER_SPACING_JS}
       var d = ev && ev.data;
       if (!d || d.type !== '${PLAY_XRAY_MESSAGE_TYPE}' || !Array.isArray(d.targets)) return;
       selectMode = !!d.selectMode;
+      applySelectCursor();
       if (!selectMode) {
         lastHoverKey = null;
         lastMouseTarget = null;
@@ -1241,9 +1270,11 @@ ${RULER_SPACING_JS}
     }, true);
 
     // Soft navigations replace the DOM: drop cached elements so the next
-    // frame re-resolves against the new document.
+    // frame re-resolves against the new document, and re-inject the select
+    // cursor style the swap dropped with the old head (idempotent by id).
     document.addEventListener('astro:page-load', function () {
       for (var i = 0; i < targets.length; i++) targets[i].el = null;
+      applySelectCursor();
       if (!raf && targets.length) raf = requestAnimationFrame(frame);
     });
 
@@ -1258,18 +1289,21 @@ ${RULER_SPACING_JS}
     var commentTargets = [];
     var commentRaf = 0;
     var commentSnapshot = '';
-    var commentCursorApplied = false;
-    var commentPrevCursor = '';
-
     function applyCommentCursor() {
-      if (!document.body) return;
-      if (commentMode === 'add' && !commentCursorApplied) {
-        commentPrevCursor = document.body.style.cursor;
-        document.body.style.cursor = 'crosshair';
-        commentCursorApplied = true;
-      } else if (commentMode !== 'add' && commentCursorApplied) {
-        document.body.style.cursor = commentPrevCursor;
-        commentCursorApplied = false;
+      var existing = document.getElementById('meno-comment-add-cursor');
+      if (commentMode === 'add') {
+        // A body-level cursor loses to any element with its own cursor (e.g. a
+        // link's 'pointer'), so force the crosshair on every element via a
+        // global !important rule. Keyed by id so it survives / re-injects across
+        // soft navigations without duplicating.
+        if (!existing && document.head) {
+          var styleEl = document.createElement('style');
+          styleEl.id = 'meno-comment-add-cursor';
+          styleEl.textContent = '*, *::before, *::after { cursor: crosshair !important; }';
+          document.head.appendChild(styleEl);
+        }
+      } else if (existing && existing.parentNode) {
+        existing.parentNode.removeChild(existing);
       }
     }
 
@@ -1358,7 +1392,8 @@ ${RULER_SPACING_JS}
     document.addEventListener('astro:page-load', function () {
       for (var i = 0; i < commentTargets.length; i++) commentTargets[i].el = null;
       commentSnapshot = '';
-      commentCursorApplied = false;
+      // Soft nav dropped the injected cursor style with the old DOM;
+      // applyCommentCursor re-injects (idempotent by id) if still in add mode.
       applyCommentCursor();
       scheduleComments();
     });

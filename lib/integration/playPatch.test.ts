@@ -2143,7 +2143,32 @@ describe('bridge contract', () => {
     expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain("addEventListener('pagehide'");
     expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain('sessionStorage');
     expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain('window.scrollTo');
-    // restore only when the saved URL still matches (no stale offset after a nav)
-    expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain('savedScroll.u === location.href');
+    // restore only when the saved URL still matches (no stale offset after a nav);
+    // the match ignores the studio's ?t=<buildTimestamp> cache-buster, which
+    // Preview.tsx appends when it reloads the play iframe by re-assigning src
+    expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain(
+      "normScrollUrl(savedScroll.u) === normScrollUrl(location.href)",
+    );
+    expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain("searchParams.delete('t')");
+    // first restore runs at DOMContentLoaded (before first paint), not at 'load' —
+    // waiting for images/fonts paints the page at the top, then visibly jumps down
+    expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain("addEventListener('DOMContentLoaded', restoreScroll)");
+    // the jump must be INSTANT: a theme's html { scroll-behavior: smooth } would
+    // otherwise animate every restore (visible up-then-down bounce on reload) —
+    // the bridge forces inline scroll-behavior:auto for the duration of the jump
+    expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain("scrollBehavior = 'auto'");
+  });
+
+  test('bridge settles one-shot animations on editor reloads and moved subtrees', () => {
+    // an editor reload (same-URL restore) snaps entrance animations to their end
+    // state instead of replaying every intro over the restored viewport
+    expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain('settleAnimations(document)');
+    // a moved element is re-inserted — brand-new to the browser — so BOTH move
+    // paths (optimistic on receipt + reconcile in applyStructureOp) settle it
+    expect(PATCH_JS).toContain('function settleAnimations');
+    expect(PATCH_JS.split('settleAnimations(mvEl)').length - 1).toBe(2);
+    // infinite animations (pulses/spinners) cannot finish() — the per-animation
+    // catch leaves them running rather than aborting the whole settle
+    expect(PATCH_JS).toContain('.finish()');
   });
 });

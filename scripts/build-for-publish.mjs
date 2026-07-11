@@ -48,6 +48,7 @@ await build({
     'lib/integration/index.ts',
     'lib/components/index.ts',
     'lib/runtime/localeMiddleware.ts',
+    'lib/runtime/componentPreviews.ts',
   ],
   outdir: 'dist',
   outbase: '.',
@@ -90,6 +91,8 @@ pkg.exports = {
   // (injectRoute), not through the components barrel. Copied by step 4 above.
   './components/LocaleRoute.astro': './dist/lib/components/LocaleRoute.astro',
   './runtime/localeMiddleware': './dist/lib/runtime/localeMiddleware.js',
+  // Play-only component-previews endpoint (injected by the integration in play mode).
+  './runtime/componentPreviews': './dist/lib/runtime/componentPreviews.js',
 };
 delete pkg.publishConfig;
 pkg.dependencies = { ...pkg.dependencies, 'meno-core': `^${coreVersion}` };

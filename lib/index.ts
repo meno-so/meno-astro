@@ -60,7 +60,15 @@ import { toHtmlString } from './runtime/richText';
 // forward-incompatible emitted-shape change. The Embed half needs the updated `Embed.astro`
 // runtime (this package). The registry (`src/cmsComponents.ts`) is now written for any project
 // with components, not just CMS ones (a rich-text prop can appear on a non-CMS page).
-export const dialectVersion = '0.1.7' as const;
+// 0.1.8: rich-text rendering is TIERED by the field/prop's `editor` meta. The 0.1.3–0.1.7 blanket
+// `richTextWithComponents(<chain>, cmsComponents)` is now emitted ONLY for **Extended** bindings
+// (`editor:"extended"`); a **Basic** binding (`editor` absent/`"basic"`, the common case) emits the
+// lean `richText(<chain>)` and imports NO registry — for a CMS text child, a `type:"rich-text"` PROP,
+// and an `<Embed>` of a rich-text field (Basic omits `components={cmsComponents}`). Backward-COMPATIBLE
+// parse: `reverseI18nWrap` has always reversed `richText(<chain>)` → `{{<chain>}}` (it was the pre-0.1.3
+// form), and `richText` has shipped since <0.1.3, so an older parser+runtime read the leaner output
+// correctly. Bumped as a capability stamp (emit picks the form from `editor`), not a hard requirement.
+export const dialectVersion = '0.1.8' as const;
 
 // ---------------------------------------------------------------------------
 // Model types re-exported for the dialect + generated projects. These are the

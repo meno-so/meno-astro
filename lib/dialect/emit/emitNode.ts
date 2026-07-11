@@ -110,6 +110,26 @@ function guardUnscopedCms(inner: string, ctx?: EmitContext): string | null {
 }
 
 /**
+ * A prop list reads its source straight from the surrounding scope: `list(items).map(…)`. On a
+ * PAGE (pages have no props) — or in a component that doesn't declare that prop — the identifier
+ * is undeclared, so `list(items)` is a build-time `ReferenceError: items is not defined` that
+ * takes down the WHOLE page. That is exactly what a freshly-added List node hits: its default
+ * `{{items}}` source names a prop nothing provides yet (add-a-List-then-render). Guard an
+ * OUT-OF-SCOPE bare identifier so it resolves to `[]` (an empty list renders nothing) instead of
+ * throwing: `typeof items === 'undefined' ? [] : items` — `typeof` is the one reference form safe
+ * on an undeclared identifier, and it only helps a BARE identifier (a member chain like
+ * `category.items` still needs its root in scope, which the bare-ident test below enforces). A
+ * declared prop (in `ctx.inScope`) or an enclosing loop var keeps the clean `list(items)`. The
+ * parser reverses the guard back to the bare source (reversePropListGuard), so it round-trips.
+ * Mirrors {@link guardUnscopedCms}.
+ */
+function guardUnscopedPropSource(sourceExpr: string, ctx: EmitContext): string {
+  if (!/^[A-Za-z_$][\w$]*$/.test(sourceExpr)) return sourceExpr;
+  if (ctx.inScope.has(sourceExpr) || ctx.loopVars.includes(sourceExpr)) return sourceExpr;
+  return `typeof ${sourceExpr} === 'undefined' ? [] : ${sourceExpr}`;
+}
+
+/**
  * Value-position wraps for a single template expression, in precedence order: the dead-`cms`
  * build guard (out-of-scope `{{cms.*}}`) first, else the CMS-data i18n() wrap. They are mutually
  * exclusive — `cms` is i18n-wrapped only when it IS in scope, the guard fires only when it isn't.
@@ -844,11 +864,12 @@ function memberTemplate(s: string): { root: string; field: string; chain: string
 }
 
 /** If `s` is exactly one `{{ cms.<field>… }}` template whose top-level field is a CMS rich-text
- *  field in scope, return the inner chain (e.g. `cms.content`); else null. */
-function cmsRichTextChain(s: string, ctx: EmitContext): string | null {
+ *  field in scope, return `{chain, field}` (e.g. `{chain:'cms.content', field:'content'}`); else
+ *  null. `field` lets the caller tier the render form by `cmsRichTextExtendedFields`. */
+function cmsRichTextChain(s: string, ctx: EmitContext): { chain: string; field: string } | null {
   if (!ctx.cmsRichTextFields?.size) return null;
   const m = s.match(/^\{\{\s*(cms\.([A-Za-z_$][\w$]*)(?:\.[A-Za-z_$][\w$]*)*)\s*\}\}$/);
-  return m && ctx.cmsRichTextFields.has(m[2] ?? '') ? (m[1] ?? null) : null;
+  return m && ctx.cmsRichTextFields.has(m[2] ?? '') ? { chain: m[1] ?? '', field: m[2] ?? '' } : null;
 }
 
 /**
@@ -874,40 +895,57 @@ function emitTextChild(text: string, ctx: EmitContext, forceExpr = false): strin
   }
   const ident = bareTemplateIdent(text);
   if (ident && ctx.richTextProps?.has(ident)) {
-    // A `type:"rich-text"` prop can carry embedded project components — a CMS rich-text field
-    // forwarded into this component's prop (`<RichBlock body={cms.content} />`) where the field
-    // contains a `menoComponent` node. Render the prop through the SAME registry-backed pass the
-    // CMS text-child path uses (`richTextWithComponents(<prop>, cmsComponents)`) so those
-    // components render instead of leaking as empty `<div data-meno-component>` markers.
-    // resolveProps already normalized the prop to an HTML string (URL embeds expanded, generic
-    // component markers preserved) and richTextWithComponents is idempotent on strings, so this
-    // composes. The parser reverses `richTextWithComponents(<ident>, cmsComponents)` → `{{ident}}`
-    // (parseValue), which re-emits here because `ident` is a rich-text prop, so it round-trips.
-    ctx.needsCmsComponents = true;
-    return `<Fragment set:html={${needRuntime(ctx, 'richTextWithComponents')}(${ident}, cmsComponents)} />`;
+    // A rich-text prop renders as REAL HTML; the FORM is tiered by the prop's `editor` meta
+    // (EmitContext.richTextExtendedProps). BASIC (`editor` absent/`'basic'`) → the lean
+    // `richText(<prop>)` — resolveProps already normalized the prop to an HTML string (i18n
+    // resolved, URL embeds expanded) and richText re-runs i18n + internal-link localization and
+    // is idempotent on strings, so basic marks (spans/strong/links) survive with no component
+    // registry. EXTENDED (`editor:'extended'`) → the registry-backed
+    // `richTextWithComponents(<prop>, cmsComponents)` so a project component embedded in the value
+    // (a CMS rich-text field forwarded into this prop, e.g. `<RichBlock body={cms.content} />`)
+    // renders instead of leaking as an empty `<div data-meno-component>` marker. The parser
+    // reverses BOTH forms → `{{ident}}` (parseValue: `reverseI18nWrap` handles `richText(<chain>)`;
+    // the `richTextWithComponents(…)` branch drops the registry arg), which re-emits here because
+    // `ident` is a rich-text prop, so both round-trip.
+    if (ctx.richTextExtendedProps?.has(ident)) {
+      ctx.needsCmsComponents = true;
+      return `<Fragment set:html={${needRuntime(ctx, 'richTextWithComponents')}(${ident}, cmsComponents)} />`;
+    }
+    return `<Fragment set:html={${needRuntime(ctx, 'richText')}(${ident})} />`;
   }
-  // A CMS rich-text field bound as a text child (`{{cms.content}}`) renders its raw TipTap
-  // value as HTML via the runtime `richTextWithComponents()` — a CMS page has no resolveProps,
-  // so a plain `{i18n(cms.content)}` would string-coerce the object to "[object Object]", and
-  // embedded `menoComponent` nodes need the registry (`cmsComponents`, the generated
-  // `src/cmsComponents.ts` this flags an import for) to render as real components. The parser
-  // reverses `richTextWithComponents(<chain>, cmsComponents)` → `{{…}}`, so this round-trips.
+  // A CMS rich-text field bound as a text child (`{{cms.content}}`) renders its raw TipTap value
+  // as HTML — a CMS page has no resolveProps, so a plain `{i18n(cms.content)}` would string-coerce
+  // the object to "[object Object]". The FORM is tiered by the field's `editor` meta
+  // (cmsRichTextExtendedFields): Basic → lean `richText(cms.content)` (no registry); Extended →
+  // `richTextWithComponents(cms.content, cmsComponents)` so embedded `menoComponent` nodes render
+  // against the generated registry (`src/cmsComponents.ts`, whose import this flags). The parser
+  // reverses BOTH forms → `{{…}}`, so this round-trips.
   const cmsRt = cmsRichTextChain(text, ctx);
   if (cmsRt) {
-    ctx.needsCmsComponents = true;
-    return `<Fragment set:html={${needRuntime(ctx, 'richTextWithComponents')}(${cmsRt}, cmsComponents)} />`;
+    if (ctx.cmsRichTextExtendedFields?.has(cmsRt.field)) {
+      ctx.needsCmsComponents = true;
+      return `<Fragment set:html={${needRuntime(ctx, 'richTextWithComponents')}(${cmsRt.chain}, cmsComponents)} />`;
+    }
+    return `<Fragment set:html={${needRuntime(ctx, 'richText')}(${cmsRt.chain})} />`;
   }
   // A rich-text field of a list loop item bound as a text child (`{{tab.title}}` where the
   // list's itemSchema declares `title` as rich-text). The list-item analog of the rich-text
-  // PROP branch above: render as REAL HTML via richTextWithComponents (embedded components
-  // resolve; inline marks/spans survive) instead of shipping ESCAPED as `{tab.title}` — the
+  // PROP branch above: render as REAL HTML instead of shipping ESCAPED as `{tab.title}` — the
   // literal `<br>`/`<span>`/`<div>` hero-heading bug. renderList registered the loop var's
-  // rich-text field names in richTextLoopFields. Round-trips: the parser reverses
-  // richTextWithComponents(<chain>, cmsComponents) → `{{chain}}`, re-emitted here next pass.
+  // rich-text field names (and the Extended subset) in richTextLoopFields, so the form is tiered
+  // exactly like the prop branch: Basic → lean `richText(<chain>)` (inline marks/spans survive,
+  // no registry); Extended → `richTextWithComponents(<chain>, cmsComponents)` (embedded components
+  // resolve). Round-trips: the parser reverses both forms → `{{chain}}`, re-emitted here next pass.
   const member = memberTemplate(text);
-  if (member && ctx.richTextLoopFields?.some((f) => f.itemVar === member.root && f.fields.has(member.field))) {
-    ctx.needsCmsComponents = true;
-    return `<Fragment set:html={${needRuntime(ctx, 'richTextWithComponents')}(${member.chain}, cmsComponents)} />`;
+  const loopFrame = member
+    ? ctx.richTextLoopFields?.find((f) => f.itemVar === member.root && f.fields.has(member.field))
+    : undefined;
+  if (member && loopFrame) {
+    if (loopFrame.extendedFields.has(member.field)) {
+      ctx.needsCmsComponents = true;
+      return `<Fragment set:html={${needRuntime(ctx, 'richTextWithComponents')}(${member.chain}, cmsComponents)} />`;
+    }
+    return `<Fragment set:html={${needRuntime(ctx, 'richText')}(${member.chain})} />`;
   }
   // Direct rich-text content (checked before the generic template branch so HTML carrying a
   // {{template}} still renders as markup): strip the editor-only marker, turn {{…}} into ${…}.
@@ -938,7 +976,12 @@ function emitChildrenList(children: unknown, ctx: EmitContext): string[] {
   if (typeof children === 'string') {
     return children.length ? [emitTextChild(children, ctx)] : [];
   }
-  if (!Array.isArray(children)) return [];
+  // A direct i18n VALUE as the whole `children` (`children: { _i18n: true, … }`) — the shape the
+  // editor's globe toggle writes (i18nToggle/ChildrenSection). renderNode emits the `{i18n({…})}`
+  // wrap; without this the object is neither string nor array and the text is dropped entirely.
+  if (!Array.isArray(children)) {
+    return isI18nValue(children) ? [placeChild(renderNode(children as Node, ctx), 0)] : [];
+  }
   const multi = children.length > 1;
   return children.map((child) =>
     typeof child === 'string' ? emitTextChild(child, ctx, multi) : placeChild(renderNode(child as Node, ctx), 0),
@@ -1225,12 +1268,15 @@ function renderEmbed(node: Node, ctx: EmitContext): Rendered {
     } else {
       attrs.push(`html={${expr}}`);
     }
-    // An Embed bound entirely to a CMS rich-text field (`<Embed html={{cms.content}} />`) can
+    // An EXTENDED CMS rich-text field bound to an Embed (`<Embed html={{cms.content}} />`) can
     // carry embedded `menoComponent` nodes — pass the component registry so Embed.astro renders
-    // them (richTextWithComponents) instead of leaking empty markers. The `components` attr is
+    // them (richTextWithComponents) instead of leaking empty markers. A BASIC field drops the
+    // `components` attr: Embed.astro then normalizes via richText (expandRichTextComponents
+    // early-returns without a marker, so the registry is dead weight). The `components` attr is
     // emit-only plumbing: re-derived here from the html binding, and dropped on parse, so it
-    // round-trips. Same detection (cmsRichTextChain) + registry as the text-child path.
-    if (cmsRichTextChain(node.html, ctx)) {
+    // round-trips. Same detection (cmsRichTextChain) + Extended tiering as the text-child path.
+    const embedCms = cmsRichTextChain(node.html, ctx);
+    if (embedCms && ctx.cmsRichTextExtendedFields?.has(embedCms.field)) {
       ctx.needsCmsComponents = true;
       attrs.push('components={cmsComponents}');
     }
@@ -1393,7 +1439,12 @@ function renderList(node: Node, ctx: EmitContext): Rendered {
   // interface, so collection/remote/etc. sources simply find nothing here.
   const sourceName = typeof node.source === 'string' ? (bareTemplateIdent(node.source) ?? node.source) : undefined;
   const richItemFields = sourceName ? ctx.richTextItemFields?.get(sourceName) : undefined;
-  if (richItemFields?.size) (ctx.richTextLoopFields ??= []).push({ itemVar, fields: richItemFields });
+  // The Extended subset of this list's rich-text fields (empty when none is `editor:'extended'`)
+  // rides along so emitTextChild can pick the heavy vs lean render form per field.
+  const richItemExtendedFields =
+    (sourceName ? ctx.richTextItemExtendedFields?.get(sourceName) : undefined) ?? new Set<string>();
+  if (richItemFields?.size)
+    (ctx.richTextLoopFields ??= []).push({ itemVar, fields: richItemFields, extendedFields: richItemExtendedFields });
   ctx.loopVars.push(itemVar);
   const childBlocks = emitChildrenList(itemChildren, ctx);
   ctx.loopVars.pop();
@@ -1503,7 +1554,10 @@ function renderList(node: Node, ctx: EmitContext): Rendered {
   // Use the (possibly aliased) local name for the `list` helper: a prop named `list` shadows
   // the import, so `list(list)` would call the Array. When aliased, this emits `list$(list)`.
   const listFn = ctx.runtimeAliases?.get('list') ?? 'list';
-  const listCall = opts ? `${listFn}(${sourceExpr}, ${opts})` : `${listFn}(${sourceExpr})`;
+  // Guard an undeclared bare-identifier source (default `{{items}}` on a page / a component
+  // that doesn't declare the prop) so it can't crash the build with a ReferenceError.
+  const guardedSource = guardUnscopedPropSource(sourceExpr, ctx);
+  const listCall = opts ? `${listFn}(${guardedSource}, ${opts})` : `${listFn}(${guardedSource})`;
   const expr = `${listCall}.map((${params}) => (\n${childRenderedAt2}\n))`;
   return { kind: 'expr', expr };
 }
@@ -1711,6 +1765,16 @@ export function renderNode(node: Node, ctx: EmitContext): Rendered {
   // structure or an `if`, so it bypasses the type switch and `applyIf`).
   if (isCodeMarker(node)) {
     return { kind: 'expr', expr: codeExpr(node.expr, ctx) };
+  }
+  // An i18n VALUE (`{ _i18n: true, en: "…", pl: "…" }`) in CHILD position — a translated text
+  // node (`<h1>{i18n({…})}</h1>`). Mirrors emitAttr's prop-side i18n wrap: the model carries the
+  // object as a `children` value and meno-core resolves it per-locale (ssrRenderer/ComponentBuilder
+  // handle an i18n object anywhere `children` is accepted). Without this it falls to the `default`
+  // case below → a `{/* meno:unknown */}` comment, silently dropping EVERY locale on save/convert.
+  // Parse reverses the `i18n({…})` call back to the object (interpretExprValue). Never has an `if`.
+  if (isI18nValue(node)) {
+    needRuntime(ctx, 'i18n');
+    return { kind: 'expr', expr: `i18n(${serializeLiteral(node, { indent: INDENT, width: ctx.width })})` };
   }
   let rendered: Rendered;
   switch (node.type) {

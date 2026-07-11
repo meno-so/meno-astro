@@ -74,6 +74,23 @@ export function buildImportLines(ctx: EmitContext, opts: ImportOptions): string[
 }
 
 /**
+ * Ensure the data helpers a verbatim `_frontmatter` passthrough references are imported. An
+ * ORPHANED data binding — a `getCollectionList`/`getRemoteData`/`getSanityData` const the parser
+ * kept in `_frontmatter` because no body list node consumes it (it feeds hand-authored code that
+ * maps over a DERIVED var) — still needs its `meno-astro` helper import (and, for
+ * `getCollectionList`, astro:content's `getCollection`). The body walk that normally registers
+ * these never saw the const, so recover them from the passthrough text. Word-anchored so
+ * `getCollection` doesn't match inside `getCollectionList`. Runs before `buildImportLines`.
+ */
+export function recoverPassthroughDataImports(ctx: EmitContext, passthrough: string | undefined): void {
+  if (!passthrough) return;
+  if (/\bgetCollectionList\b/.test(passthrough)) ctx.runtime.add('getCollectionList');
+  if (/\bgetRemoteData\b/.test(passthrough)) ctx.runtime.add('getRemoteData');
+  if (/\bgetSanityData\b/.test(passthrough)) ctx.runtime.add('getSanityData');
+  if (/\bgetCollection\b/.test(passthrough)) ctx.needsContentApi = true;
+}
+
+/**
  * `isEditorMode` — meno-core's global template variable (true only inside the Studio
  * editor; default false). The emitted `.astro` is the production/preview artifact, so it
  * always resolves to false. Pages/components define it as a frontmatter const when their

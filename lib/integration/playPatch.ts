@@ -1715,6 +1715,23 @@ export const PATCH_JS = `
       else anchor.ref.parentNode.insertBefore(el, anchor.ref); // 'before'
     }
 
+    // Snap a subtree's one-shot animations to their finished state. A moved element
+    // is re-inserted, and the browser treats a re-inserted node as brand-new — its
+    // CSS entrance animations (fade/slide-in intros) restart from zero, which reads
+    // as the page re-animating on a simple reorder. finish() jumps them to their
+    // filled end state. Infinite animations (pulses, spinners) cannot finish() —
+    // that throw is caught per-animation, so they keep running untouched. Root may
+    // be the document (editor-reload settle) or a single element (move settle).
+    function settleAnimations(root) {
+      try {
+        if (!root || !root.getAnimations) return;
+        var anims = root.getAnimations({ subtree: true });
+        for (var i = 0; i < anims.length; i++) {
+          try { anims[i].finish(); } catch (e) { /* infinite — leave running */ }
+        }
+      } catch (e) {}
+    }
+
     // Apply the structural change directly. We deliberately do NOT wrap it in
     // document.startViewTransition: with no element assigned a view-transition-name,
     // the browser runs its default *root* snapshot transition, which cross-fades the
@@ -1745,6 +1762,7 @@ export const PATCH_JS = `
         if (!mvEl) throw new Error('meno-play: optimistic move source not found');
         var parent = op.toParent ? resolveTarget(op.toParent) : null;
         placeByAnchor(mvEl, resolveAnchor(op.anchor, parent));
+        settleAnimations(mvEl); // re-insertion restarts its entrance animations
       } else {
         throw new Error('meno-play: optimistic apply supports move/remove only');
       }
@@ -1792,6 +1810,7 @@ export const PATCH_JS = `
         // re-extract from fetched and never re-run its script.
         mutate = function () {
           placeByAnchor(mvEl, mAnchor);
+          settleAnimations(mvEl); // re-insertion restarts its entrance animations
         };
       } else {
         throw new Error('meno-play: unsupported structure op ' + op.kind);
@@ -2108,8 +2127,12 @@ ${PATCH_JS}
     // iframe scrolls natively in play mode, so without this it snaps to the top on
     // every reload — which reads as the whole project reloading. Save on pagehide,
     // restore on the next load when the URL still matches (then clear, so a real
-    // navigation never restores a stale offset), re-asserting a few times to win
-    // against late JS/layout shift.
+    // navigation never restores a stale offset). The FIRST restore must run at
+    // DOMContentLoaded: the full DOM is parsed there, so the page already has its
+    // content height, and it fires before first paint in the common case — waiting
+    // for 'load' (all images/fonts) paints the page at the top first and then
+    // visibly jumps back down. 'load' + the timers stay as re-asserts to win
+    // against late layout shift (images sizing in, web fonts swapping).
     try {
       var SCROLL_KEY = 'meno:play:scroll';
       window.addEventListener('pagehide', function () {
@@ -2119,11 +2142,46 @@ ${PATCH_JS}
       });
       var savedScroll = null;
       try { savedScroll = JSON.parse(sessionStorage.getItem(SCROLL_KEY) || 'null'); } catch (e) {}
-      if (savedScroll && savedScroll.u === location.href) {
+      // Compare URLs with the studio's cache-buster stripped: Preview.tsx reloads
+      // the play iframe by re-assigning src with a fresh ?t=<buildTimestamp>
+      // (play-mode entry, manual refresh, CMS auto-refresh), so the saved href
+      // and the new href differ ONLY by t= — still the same page, and skipping
+      // the restore there is exactly the snap-to-top the key exists to prevent.
+      var normScrollUrl = function (u) {
+        try { var p = new URL(u, location.href); p.searchParams.delete('t'); return p.href; } catch (e) { return u; }
+      };
+      if (savedScroll && normScrollUrl(savedScroll.u) === normScrollUrl(location.href)) {
         try { sessionStorage.removeItem(SCROLL_KEY); } catch (e) {}
-        var restoreScroll = function () { try { window.scrollTo(savedScroll.x, savedScroll.y); } catch (e) {} };
-        if (document.readyState === 'complete') restoreScroll();
-        else window.addEventListener('load', restoreScroll);
+        // The restore must be an INSTANT jump. The 2-arg scrollTo obeys the page's
+        // CSS scroll-behavior, and a theme with html { scroll-behavior: smooth }
+        // (a stock theme.css choice) turns every restore into a visible animated
+        // scroll from the top — the reload reads as "scrolled up, then back down"
+        // (and each re-assert restarts the animation, which can also leave it
+        // parked at 0 when a re-assert cancels an in-flight smooth scroll).
+        // Temporarily forcing inline scroll-behavior:auto defeats the CSS in every
+        // browser, without depending on ScrollBehavior 'instant' support.
+        var restoreScroll = function () {
+          try {
+            var de = document.documentElement;
+            var bd = document.body;
+            var prevDe = de.style.scrollBehavior;
+            var prevBd = bd ? bd.style.scrollBehavior : '';
+            de.style.scrollBehavior = 'auto';
+            if (bd) bd.style.scrollBehavior = 'auto';
+            try { window.scrollTo(savedScroll.x, savedScroll.y); } catch (e) {}
+            de.style.scrollBehavior = prevDe;
+            if (bd) bd.style.scrollBehavior = prevBd;
+            // Editor reload (the same-URL match above): also snap one-shot entrance
+            // animations to their end state, so a structural edit's full reload
+            // doesn't replay every intro over the just-restored viewport. A real
+            // first visit has no saved entry and animates normally; infinite
+            // animations survive (settleAnimations skips what cannot finish()).
+            settleAnimations(document);
+          } catch (e) {}
+        };
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', restoreScroll);
+        else restoreScroll();
+        window.addEventListener('load', restoreScroll);
         setTimeout(restoreScroll, 0);
         setTimeout(restoreScroll, 100);
         setTimeout(restoreScroll, 300);

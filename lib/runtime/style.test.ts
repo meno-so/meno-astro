@@ -245,6 +245,26 @@ describe('cx', () => {
   test('unrecognized/foreign classes are always kept (never dedup away)', () => {
     expect(cx('swiper', 'swiper-active', 'p-[8px]')).toBe('swiper swiper-active p-[8px]');
   });
+
+  test('a BARE color-token base class is displaced by an instance color override', () => {
+    // The reported bug: a Button root has a static `bg-accent` (bare token — classToStyle can't resolve
+    // it without the project token set) and the instance overrides bgClr → `bg-[var(--gray-200)]`. Both
+    // are background-color; without recovering the property from the `bg` root the base would survive and
+    // win by stylesheet order. The instance (later arg) must win and the bare token must be dropped.
+    const out = cx('p-[8px] bg-accent text-[var(--white)] rounded-[4px]', 'bg-[var(--gray-200)] text-text');
+    expect(out).not.toContain('bg-accent'); // component default dropped
+    expect(out).toContain('bg-[var(--gray-200)]'); // instance override kept
+    expect(out).not.toContain('text-[var(--white)]'); // ditto for color
+    expect(out).toContain('text-text');
+    expect(out).toContain('p-[8px]'); // non-color base classes untouched
+    expect(out).toContain('rounded-[4px]');
+  });
+
+  test('bare-token color override also works via the shorthand form', () => {
+    // `bg-(--accent)` (variant shorthand) and `bg-accent` (bare) must share a merge key too.
+    expect(cx('bg-(--accent)', 'bg-muted')).toBe('bg-muted');
+    expect(cx('bg-primary', 'bg-[var(--x)]')).toBe('bg-[var(--x)]');
+  });
 });
 
 describe('variants', () => {

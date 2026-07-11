@@ -11,7 +11,7 @@
  */
 
 import { singularize } from 'meno-core/shared';
-import { isStyleMapping } from 'meno-core/shared';
+import { isStyleMapping, isI18nValue } from 'meno-core/shared';
 import { sanitizeCssValue } from '../runtime/cssValue';
 import { isBindableIdent } from './ident';
 import { scanTemplate, scanString } from './parse/scan';
@@ -110,13 +110,21 @@ function sanitizeInteractive(rules: unknown[]): unknown[] {
   return changed ? out : rules;
 }
 
-/** Canonicalize a children/default list: normalize items, drop if empty, collapse a lone string. */
+/** Canonicalize a children/default list: normalize items, drop if empty, collapse a lone
+ * string OR a lone i18n value. A translated text node carries its i18n value ({ _i18n: true,
+ * en, pl }) DIRECTLY in `children` — the shape the editor's globe toggle writes and meno-core
+ * resolves per-locale. It is neither a string nor an array, so without the first guard it would
+ * be dropped here (returned `undefined` → deleted), silently losing every locale on the first
+ * save. The lone-array collapse mirrors parse's finalizeChildren so a sole i18n child has ONE
+ * canonical form (direct) whichever side produced it, keeping parse(emit(x)) === x. */
 function normalizeChildren(children: unknown): unknown {
   if (typeof children === 'string') return children;
+  if (isI18nValue(children)) return children;
   if (!Array.isArray(children)) return undefined;
   const items = children.map(normalizeChild);
   if (items.length === 0) return undefined;
   if (items.length === 1 && typeof items[0] === 'string') return items[0];
+  if (items.length === 1 && isI18nValue(items[0])) return items[0];
   return items;
 }
 

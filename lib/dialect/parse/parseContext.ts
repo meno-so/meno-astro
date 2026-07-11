@@ -86,6 +86,18 @@ export interface ParseContext {
    */
   spans?: Map<object, NodeSpan>;
   /**
+   * Names of collection/remote/sanity data bindings the BODY actually consumes as a list
+   * source (`<binding>.map(…)`, `queryList(<binding>, …)`). Populated while parsing the body.
+   * A binding declared in frontmatter but NOT consumed here is ORPHANED — the emitter only
+   * regenerates a `getCollectionList`/`getRemoteData`/`getSanityData` const when a body list
+   * node references it, so an orphaned binding would be dropped on the next emit, dangling the
+   * hand-authored frontmatter code that uses it (e.g. `const visible = providersList.filter(…)`
+   * mapping over a DERIVED var). `parseFile` passes this set to the passthrough extractor so an
+   * orphaned binding stays in the verbatim `_frontmatter` block instead. Not recorded during the
+   * round-trip gate's transient re-parse (guarded by `_expressionListReparse`).
+   */
+  consumedDataBindings?: Set<string>;
+  /**
    * Transient guard set only while the expression-list round-trip gate re-parses an emitted
    * candidate (see parseBody's expressionListRoundTrips). It makes the `<expr>.map(…)` →
    * expression-list promotion take its UNGATED branch, so the gate's inner re-parse doesn't
@@ -106,5 +118,6 @@ export function createParseContext(): ParseContext {
     templateConsts: new Map(),
     codeConsts: new Map(),
     tagConsts: new Map(),
+    consumedDataBindings: new Set(),
   };
 }
