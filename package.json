@@ -1,6 +1,6 @@
 {
   "name": "meno-astro",
-  "version": "0.1.39",
+  "version": "0.1.40",
   "type": "module",
   "description": "Meno-Astro: runtime helpers + the round-trippable .astro dialect (emit/parse) that lets Meno use Astro files as a source-of-truth format.",
   "license": "MIT",
