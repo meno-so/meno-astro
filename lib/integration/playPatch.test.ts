@@ -1498,11 +1498,71 @@ describe('PATCH_JS optimistic structure ops (move/remove on receipt)', () => {
     expect(divs[1]!.getAttribute('data-element-path')).toBe('0,1');
   });
 
-  test('insert is unsupported by the optimistic path → throws (listener falls back to the gated apply)', () => {
+  test('a GENERIC insert (no cloneOf) is unsupported by the optimistic path → throws (listener falls back to the gated apply)', () => {
     setup('<section data-element-path="0"><div data-element-path="0,0">a</div></section>');
     expect(() =>
       applyStructureOpOptimistic({ kind: 'insert', parent: id('0'), newNode: id('0,1'), anchor: { after: id('0,0') } }),
     ).toThrow();
+  });
+
+  test('duplicate insert (cloneOf) shows an instant placeholder: live clone, ALL stamps stripped', () => {
+    setup(
+      '<section data-element-path="0">' +
+        '<div data-element-path="0,0">a<span data-element-path="0,0,0" data-meno-instance="x">deep</span></div>' +
+        '</section>',
+    );
+    applyStructureOpOptimistic({
+      kind: 'insert',
+      parent: id('0'),
+      newNode: id('0,1'),
+      anchor: { after: id('0,0') },
+      cloneOf: id('0,0'),
+    });
+    const divs = doc.querySelectorAll('section > div');
+    expect(divs.length).toBe(2);
+    const placeholder = divs[1]!;
+    expect(placeholder.textContent).toBe('adeep'); // visually the duplicated subtree
+    expect(placeholder.hasAttribute('data-meno-optimistic-clone')).toBe(true);
+    // Every identity stamp stripped, root AND descendants — the placeholder must
+    // never shadow resolveTarget/anchor resolution while it waits for the patch.
+    expect(placeholder.hasAttribute('data-element-path')).toBe(false);
+    expect(placeholder.querySelector('[data-element-path]')).toBeNull();
+    expect(placeholder.querySelector('[data-meno-instance]')).toBeNull();
+    // The source keeps its stamps untouched.
+    expect(divs[0]!.getAttribute('data-element-path')).toBe('0,0');
+  });
+
+  test('reconcile: the structure patch swaps the placeholder for the authoritative SSR markup + re-stamps', () => {
+    setup('<section data-element-path="0"><div data-element-path="0,0">a</div></section>');
+    const op = {
+      kind: 'insert',
+      parent: id('0'),
+      newNode: id('0,1'),
+      anchor: { after: id('0,0') },
+      cloneOf: id('0,0'),
+    };
+    applyStructureOpOptimistic(op); // 1) instant placeholder
+    // 2) the server's 'structure' patch lands (alreadyApplied=true). The fetched SSR's
+    // new node carries a marker attribute to prove the AUTHORITATIVE markup replaced
+    // the live clone, not merely got re-stamped over it.
+    applyPatch(
+      parse(
+        '<html><body><section data-element-path="0">' +
+          '<div data-element-path="0,0">a</div><div data-element-path="0,1" data-ssr="1">a</div>' +
+          '</section></body></html>',
+      ),
+      ['structure'],
+      [],
+      undefined,
+      op,
+      true,
+    );
+    const divs = doc.querySelectorAll('section > div');
+    expect(divs.length).toBe(2);
+    expect(doc.querySelector('[data-meno-optimistic-clone]')).toBeNull(); // placeholder gone
+    expect(divs[1]!.getAttribute('data-ssr')).toBe('1'); // SSR markup, same position
+    expect(divs[0]!.getAttribute('data-element-path')).toBe('0,0');
+    expect(divs[1]!.getAttribute('data-element-path')).toBe('0,1'); // re-stamped identity
   });
 
   test('an unresolvable target throws → the listener catches it and leaves the op for the gated path', () => {
@@ -2146,9 +2206,7 @@ describe('bridge contract', () => {
     // restore only when the saved URL still matches (no stale offset after a nav);
     // the match ignores the studio's ?t=<buildTimestamp> cache-buster, which
     // Preview.tsx appends when it reloads the play iframe by re-assigning src
-    expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain(
-      "normScrollUrl(savedScroll.u) === normScrollUrl(location.href)",
-    );
+    expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain('normScrollUrl(savedScroll.u) === normScrollUrl(location.href)');
     expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain("searchParams.delete('t')");
     // first restore runs at DOMContentLoaded (before first paint), not at 'load' —
     // waiting for images/fonts paints the page at the top, then visibly jumps down
@@ -2157,6 +2215,23 @@ describe('bridge contract', () => {
     // otherwise animate every restore (visible up-then-down bounce on reload) —
     // the bridge forces inline scroll-behavior:auto for the duration of the jump
     expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain("scrollBehavior = 'auto'");
+  });
+
+  test('bridge carries the page backdrop across reloads (no white flash in dark projects)', () => {
+    // Saved on pagehide alongside scroll…
+    expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain('meno:play:bg');
+    // …sampling what the user actually SEES: body, else html, else the first
+    // block wrapper (Meno layouts paint the dark background on a full-height
+    // section while html/body stay transparent — the exact shape that flashes
+    // white during an iframe navigation, which gets no paint holding).
+    expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain("querySelector('main,section,div')");
+    // Re-pinned SYNCHRONOUSLY in the head-inline script — before first paint.
+    expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain('document.documentElement.style.backgroundColor = savedBg.bg');
+    // Same-page reloads only (the editing loop), cache-buster-blind like scroll.
+    expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain('normScrollUrl(savedBg.u) === normScrollUrl(location.href)');
+    // The pin is lifted after load — it must never outlive the reload it papered
+    // over (an edit can legitimately change the page background).
+    expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain("document.documentElement.style.backgroundColor = ''");
   });
 
   test('bridge settles one-shot animations on editor reloads and moved subtrees', () => {

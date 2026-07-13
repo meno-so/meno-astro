@@ -109,8 +109,9 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from '../dialect';
-import { collectNodeClassTokens, collectModelClassTokens, walkAstroFiles } from './utilityCss';
-import { XRAY_RESOLVER_JS } from './xray';
+import { collectNodeClassTokens, walkAstroFiles } from './utilityCss';
+import { getProjectClassTokens } from './modelCache';
+import { XRAY_RESOLVER_JS, INSTANCE_ATTR, SLOT_ATTR } from './xray';
 // Type-only (erased at build): the play patcher receives this controller from the
 // integration's utility-CSS plugin to (a) rebuild the sheet for its patch payload and
 // (b) invalidate the virtual module in-band. No runtime import — no cycle with ./index.
@@ -719,21 +720,13 @@ interface PlayPatchServer {
  * superset: mergeClasses re-adds whatever the fresh render still uses, and JS
  * classes — never style()-shaped — are untouched). Unparseable files are
  * skipped (their classes simply won't retire — same gap as the utility sheet).
+ *
+ * Backed by the shared per-file model cache (modelCache.ts): recomputing the
+ * vocabulary after an invalidation costs one stat sweep + a set union over
+ * per-file token sets — only the actually-changed file re-parses.
  */
 function collectProjectClassVocabulary(projectRoot: string): Set<string> {
-  const out = new Set<string>();
-  const srcDir = join(projectRoot, 'src');
-  if (!existsSync(srcDir)) return out;
-  walkAstroFiles(srcDir, (p) => {
-    let model: unknown;
-    try {
-      model = parse(readFileSync(p, 'utf8')).model;
-    } catch {
-      return; // unreadable/unparseable → skip
-    }
-    for (const t of collectModelClassTokens(model)) out.add(t);
-  });
-  return out;
+  return getProjectClassTokens(projectRoot);
 }
 
 /**
@@ -1743,15 +1736,35 @@ export const PATCH_JS = `
       mutate();
     }
 
+    // Strip every X-Ray identity stamp from a cloned subtree so an optimistic
+    // placeholder can never shadow resolveTarget/anchor resolution — identities must
+    // stay unique in the live DOM until the correlated patch re-stamps everything
+    // from the fetched SSR.
+    function stripStamps(root) {
+      var attrs = ['data-element-path', '${INSTANCE_ATTR}', '${SLOT_ATTR}'];
+      var els = [root].concat([].slice.call(root.querySelectorAll ? root.querySelectorAll('*') : []));
+      for (var i = 0; i < els.length; i++) {
+        if (!els[i].removeAttribute) continue;
+        for (var j = 0; j < attrs.length; j++) els[i].removeAttribute(attrs[j]);
+      }
+    }
+
     // Optimistic (pre-patch) structural mutation: applied the instant the editor
-    // posts the op, BEFORE the server recompile + 'structure' patch land — so a
-    // move/delete shows in the play iframe immediately instead of after the multi-
-    // second save→rebuild→patch round-trip. move/remove resolve entirely against the
-    // LIVE pre-op DOM (which is exactly the numbering the op's paths assume at receipt
-    // time), so no fetched SSR is needed; insert cannot (its markup only exists after
-    // the compile). No reStampAll here — the live element keeps its pre-op stamp until
-    // the correlated patch re-stamps. A resolve failure throws; the caller catches it
-    // and falls back to the gated path (buffer, wait for the patch).
+    // posts the op, BEFORE the server recompile + 'structure' patch land — so the
+    // edit shows in the play iframe immediately instead of after the multi-second
+    // save→rebuild→patch round-trip. move/remove resolve entirely against the LIVE
+    // pre-op DOM (which is exactly the numbering the op's paths assume at receipt
+    // time), so no fetched SSR is needed. A generic insert cannot (its markup only
+    // exists after the compile) — but a DUPLICATE insert (op.cloneOf names a live
+    // node whose rendered subtree equals the inserted one) shows instantly as a
+    // stamp-stripped visual placeholder clone, which the correlated patch replaces
+    // with the authoritative SSR markup (fresh stamps + scripts; see
+    // applyStructureOp's alreadyApplied path). Listeners aren't cloned, so the
+    // placeholder is inert until that swap — the reconcile window the optimistic
+    // apply exists to paper over. No reStampAll here — the live element keeps its
+    // pre-op stamp until the correlated patch re-stamps. A resolve failure throws;
+    // the caller catches it and falls back to the gated path (buffer, wait for the
+    // patch).
     function applyStructureOpOptimistic(op) {
       if (op.kind === 'remove') {
         var el = resolveTarget(op.target);
@@ -1763,8 +1776,17 @@ export const PATCH_JS = `
         var parent = op.toParent ? resolveTarget(op.toParent) : null;
         placeByAnchor(mvEl, resolveAnchor(op.anchor, parent));
         settleAnimations(mvEl); // re-insertion restarts its entrance animations
+      } else if (op.kind === 'insert' && op.cloneOf) {
+        var srcEl = resolveTarget(op.cloneOf);
+        if (!srcEl) throw new Error('meno-play: optimistic duplicate source not found');
+        var dup = srcEl.cloneNode(true);
+        stripStamps(dup);
+        dup.setAttribute('data-meno-optimistic-clone', '');
+        var dParent = op.parent ? resolveTarget(op.parent) : null;
+        placeByAnchor(dup, resolveAnchor(op.anchor, dParent));
+        settleAnimations(dup); // cloned entrance animations restart otherwise
       } else {
-        throw new Error('meno-play: optimistic apply supports move/remove only');
+        throw new Error('meno-play: optimistic apply supports move/remove/duplicate only');
       }
     }
 
@@ -1774,11 +1796,32 @@ export const PATCH_JS = `
     // after the mutation — both throw → reload, never a half-applied page.
     function applyStructureOp(nextDoc, op, alreadyApplied) {
       if (!op || !op.kind) throw new Error('meno-play: malformed structure op');
-      // Already applied optimistically on receipt (move/remove): live is in post-op
-      // shape, so re-running the mutation would double-apply. Only re-stamp from the
-      // fetched SSR — the same reStamp the gated path runs after its own mutation, and
-      // its shortfall guard still throws → reload if the optimistic shape diverged.
+      // Already applied optimistically on receipt: live is in post-op shape, so
+      // re-running the mutation would double-apply. move/remove only re-stamp from
+      // the fetched SSR — the same reStamp the gated path runs after its own
+      // mutation, and its shortfall guard still throws → reload if the optimistic
+      // shape diverged. A duplicate insert's optimistic placeholder (a live-DOM
+      // clone, stamps stripped) is swapped for the authoritative SSR markup here —
+      // pristine markup so runScripts binds its interactivity exactly like the
+      // gated insert path, and reStampAll gives it real identities.
       if (alreadyApplied) {
+        if (op.kind === 'insert') {
+          var phEl = document.querySelector('[data-meno-optimistic-clone]');
+          var newEl = resolveTarget(op.newNode, nextDoc);
+          if (!newEl) throw new Error('meno-play: inserted node not found in fetched doc');
+          var real = newEl.cloneNode(true);
+          // Placeholder gone (page JS removed it)? Fall back to anchor placement —
+          // the placeholder carries no stamps, so anchors resolve unaffected.
+          var rParent = !phEl && op.parent ? resolveTarget(op.parent) : null;
+          var rAnchor = phEl ? null : resolveAnchor(op.anchor, rParent);
+          runStructureMutation(function () {
+            if (phEl && phEl.parentNode) phEl.parentNode.replaceChild(real, phEl);
+            else placeByAnchor(real, rAnchor);
+            runScripts(real);
+            reStampAll(nextDoc);
+          });
+          return;
+        }
         runStructureMutation(function () {
           reStampAll(nextDoc);
         });
@@ -2104,13 +2147,15 @@ ${PATCH_JS}
       var op = d.op;
       if (!op || (op.kind !== 'insert' && op.kind !== 'remove' && op.kind !== 'move')) return;
       var now = (typeof Date !== 'undefined' && Date.now) ? Date.now() : 0;
-      // Optimistic pre-patch apply: move/remove only (insert needs server markup);
+      // Optimistic pre-patch apply: move/remove, plus duplicate inserts (op.cloneOf —
+      // the markup already exists live; a generic insert still needs server markup);
       // only when nothing is mid-flight, so the exactly-one-op-per-patch invariant and
       // the pre-op stamp numbering both still hold. A second op arriving before the
       // first reconciles buffers WITHOUT applying → takeStructureOp sees > 1 → reload,
       // exactly as today. Any resolve failure falls back to the gated path.
       var applied = false;
-      if ((op.kind === 'move' || op.kind === 'remove') && opQueue.length === 0 && !inflight) {
+      var canApplyNow = op.kind === 'move' || op.kind === 'remove' || (op.kind === 'insert' && op.cloneOf);
+      if (canApplyNow && opQueue.length === 0 && !inflight) {
         try {
           applyStructureOpOptimistic(op);
           applied = true;
@@ -2185,6 +2230,58 @@ ${PATCH_JS}
         setTimeout(restoreScroll, 0);
         setTimeout(restoreScroll, 100);
         setTimeout(restoreScroll, 300);
+      }
+
+      // Kill the WHITE FLASH those same reloads paint on dark projects. Iframes get
+      // no paint holding: at navigation commit Chrome paints the new document's
+      // canvas — default white when html/body are transparent (the common Meno
+      // shape: the dark background lives on a full-height section wrapper) — for
+      // the whole parse-to-first-contentful-paint window. In a dark editor theme
+      // that reads as a white blink on every reload-classified edit, CMS
+      // auto-refresh, or patch-failure fallback. Carry the page's EFFECTIVE
+      // backdrop across the reload exactly like scroll: save it on pagehide,
+      // re-pin it as an inline html background HERE — this script is head-inline,
+      // so the pin lands before first paint — and re-converge to the fresh page's
+      // real backdrop on load (an edit may legitimately change the background;
+      // the stale pin must not outlive the reload it papered over).
+      var BG_KEY = 'meno:play:bg';
+      // The backdrop the user actually sees: body, else html, else the page's
+      // first block wrapper (Meno layouts paint there) — first non-transparent wins.
+      var effectiveBg = function () {
+        try {
+          var cands = [document.body, document.documentElement];
+          if (document.body) {
+            var probe = document.body.querySelector('main,section,div');
+            if (probe) cands.unshift(probe);
+          }
+          for (var i = 0; i < cands.length; i++) {
+            if (!cands[i]) continue;
+            var c = getComputedStyle(cands[i]).backgroundColor;
+            if (c && c !== 'transparent' && c.indexOf('rgba(0, 0, 0, 0)') === -1) return c;
+          }
+        } catch (e) {}
+        return null;
+      };
+      window.addEventListener('pagehide', function () {
+        try {
+          var bg = effectiveBg();
+          if (bg) sessionStorage.setItem(BG_KEY, JSON.stringify({ u: location.href, bg: bg }));
+        } catch (e) {}
+      });
+      var savedBg = null;
+      try { savedBg = JSON.parse(sessionStorage.getItem(BG_KEY) || 'null'); } catch (e) {}
+      if (savedBg && savedBg.bg && normScrollUrl(savedBg.u) === normScrollUrl(location.href)) {
+        // Synchronous, pre-paint: pin the previous backdrop on <html>. Invisible
+        // behind painted content; only the would-be-white window shows it. Lift it
+        // once the page has painted — the pin must never outlive the reload it
+        // papered over (an edit may legitimately change the page background, and a
+        // permanent pin would repaint transparent regions of OTHER visual states).
+        try { document.documentElement.style.backgroundColor = savedBg.bg; } catch (e) {}
+        window.addEventListener('load', function () {
+          setTimeout(function () {
+            try { document.documentElement.style.backgroundColor = ''; } catch (e) {}
+          }, 50);
+        });
       }
     } catch (e) {}
 

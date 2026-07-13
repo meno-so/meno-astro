@@ -38,7 +38,8 @@ import { createRequire } from 'node:module';
 import { ISLAND_FRAMEWORK_SPECS } from '../server/islandFrameworks';
 import { ASTRO_ADAPTER_SPECS } from '../server/adapters';
 import { buildSitemapXml } from './sitemap';
-import { buildUtilityStylesheet, walkAstroFiles, type UtilitySource } from './utilityCss';
+import { buildUtilityStylesheetFromModels, walkAstroFiles, type UtilitySource } from './utilityCss';
+import { getProjectModels } from './modelCache';
 import { xrayVitePlugin, PLAY_XRAY_BRIDGE_SCRIPT } from './xray';
 import { rewriteViewportUnitsInStylesheet } from './viewportUnits';
 import { PLAY_DESIGN_BRIDGE_SCRIPT } from './designBridge';
@@ -221,8 +222,10 @@ export const UTILITY_CSS_MODULE = 'virtual:meno-utilities.css';
 /**
  * Read every `.astro` under `<root>/src` into a {@link UtilitySource} list (each entry
  * carries its path so `buildUtilityStylesheet` can name a file in its skip warning).
- * Pure-ish (filesystem read only); shared by the plugin's `astro build` start and its
- * dev rebuild, and unit-tested directly. A missing/unreadable `src` yields `[]`.
+ * Pure-ish (filesystem read only). The plugin's own rebuild now goes through the
+ * per-file model cache instead (modelCache.ts); this survives as the uncached
+ * one-shot scan for external/ad-hoc callers and its direct unit tests.
+ * A missing/unreadable `src` yields `[]`.
  */
 export function collectUtilitySources(projectRoot: string): UtilitySource[] {
   const sources: UtilitySource[] = [];
@@ -319,8 +322,10 @@ function utilityCssVitePlugin(
     // (`p-[24px]`) ships in rem when enabled — matching meno-core's render path. Read fresh
     // each rebuild (cheap single-file read); a later config edit is picked up next rebuild.
     const remConfig = readRemConfigSync(projectRoot);
-    css = buildUtilityStylesheet(
-      collectUtilitySources(projectRoot),
+    // Models come from the per-file cache (stat-swept), so a single edit re-parses one
+    // file — not the whole project — before the play patch can broadcast (modelCache.ts).
+    css = buildUtilityStylesheetFromModels(
+      getProjectModels(projectRoot),
       breakpoints,
       responsiveScales,
       knownTokens,

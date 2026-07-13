@@ -310,22 +310,44 @@ export function buildUtilityStylesheet(
   knownTokens?: ReadonlySet<string>,
   remConfig?: RemConversionConfig,
 ): string {
-  const classes = new Set<string>();
-  const inter = { css: '', seen: new Set<string>() };
+  const models: unknown[] = [];
   for (const entry of sources) {
     const src = typeof entry === 'string' ? entry : entry.src;
     const path = typeof entry === 'string' ? undefined : entry.path;
-    let model: unknown;
     try {
-      model = parse(src).model;
+      models.push(parse(src).model);
     } catch (err) {
-      console.warn(
-        `[meno-astro] utility-CSS: could not parse ${path ?? 'a .astro file'} — its style() classes ` +
-          `will be missing from the page. This usually means the installed meno-astro is older than the ` +
-          `converter that produced this file. Parse error: ${(err as Error).message}`,
-      );
-      continue;
+      warnUnparseableUtilitySource(path, err);
     }
+  }
+  return buildUtilityStylesheetFromModels(models, breakpoints, responsiveScales, knownTokens, remConfig);
+}
+
+/** The skip warning both the source path above and the model cache emit on a failed parse. */
+export function warnUnparseableUtilitySource(path: string | undefined, err: unknown): void {
+  console.warn(
+    `[meno-astro] utility-CSS: could not parse ${path ?? 'a .astro file'} — its style() classes ` +
+      `will be missing from the page. This usually means the installed meno-astro is older than the ` +
+      `converter that produced this file. Parse error: ${(err as Error).message}`,
+  );
+}
+
+/**
+ * The model half of {@link buildUtilityStylesheet}: build the sheet from ALREADY-PARSED
+ * models. The dev/play `rebuild()` path calls this with the per-file model cache
+ * (see modelCache.ts) so an edit re-parses only the changed file instead of every
+ * `.astro` in the project on each keystroke-sized change.
+ */
+export function buildUtilityStylesheetFromModels(
+  models: unknown[],
+  breakpoints: BreakpointConfig = DEFAULT_BREAKPOINTS,
+  responsiveScales?: ResponsiveScales,
+  knownTokens?: ReadonlySet<string>,
+  remConfig?: RemConversionConfig,
+): string {
+  const classes = new Set<string>();
+  const inter = { css: '', seen: new Set<string>() };
+  for (const model of models) {
     walkModel(model, classes, inter, breakpoints, responsiveScales, remConfig);
   }
   // State-variant classes (`hover:bg-[#222]`) aren't meno-core utilities — generateUtilityCSS
