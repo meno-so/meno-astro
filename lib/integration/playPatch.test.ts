@@ -2162,12 +2162,26 @@ describe('bridge contract', () => {
     expect(extractScriptBlocks('<div>x</div><script>a()</script>')).toBe('<script>a()</script>');
   });
 
-  test('bridge rides vite client hot context with reload fallback, iframe-only', () => {
+  test('bridge rides vite client hot context with reload fallback, patching iframe-only', () => {
     expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain(`'${PLAY_PATCH_EVENT}'`);
     expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain("import('/@vite/client')");
     expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain('createHotContext');
     expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain('location.reload');
     expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain('window.self !== window.top');
+  });
+
+  test('top-level tabs (not the editor iframe) reload on patch events instead of going stale', () => {
+    // Patchable edits suppress Vite's stock full-reload for EVERY client, so a
+    // plain http://localhost:<port> preview tab must subscribe too — it maps
+    // patch events to a debounced reload (deferred while the tab is hidden).
+    expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain("createHotContext('/__meno-play-preview')");
+    expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain('pendingWhileHidden');
+    expect(PLAY_PATCH_BRIDGE_SCRIPT).toContain("addEventListener('visibilitychange'");
+    // The top-level branch is the iframe gate's else — both subscriptions ride
+    // the same event name.
+    const idx = PLAY_PATCH_BRIDGE_SCRIPT.indexOf('window.self !== window.top');
+    expect(idx).toBeGreaterThan(-1);
+    expect(PLAY_PATCH_BRIDGE_SCRIPT.split(`'${PLAY_PATCH_EVENT}'`).length).toBeGreaterThanOrEqual(3);
   });
 
   test('bridge embeds the X-Ray resolver and listens for optimistic style previews', () => {

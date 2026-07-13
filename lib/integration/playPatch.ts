@@ -2299,5 +2299,38 @@ ${PATCH_JS}
       })
       .catch(function () {});
   })();
+} else {
+  // ── Top-level tab (not the editor iframe) ──────────────────────────────
+  // e.g. http://localhost:4321 opened in a second browser tab/window as a live
+  // preview next to the editor. Patchable edits SUPPRESS Vite's stock full
+  // reload (the plugin empties the HMR module list and broadcasts the patch
+  // event for the iframe bridge above instead), so without a listener a plain
+  // tab silently goes stale until a manual refresh. In-place patching is an
+  // editor-iframe affair (a 'structure' patch must pair with the editor-posted
+  // op, which never reaches this tab), so every patch event maps to a
+  // debounced stock reload — exactly what plain "astro dev" would have done.
+  // Hidden tabs defer the reload until next visible (one reload instead of one
+  // per edit); scroll survives via the browser's native reload restoration.
+  (function () {
+    var timer = 0;
+    var pendingWhileHidden = false;
+    function reloadNow() {
+      try { window.location.reload(); } catch (e) {}
+    }
+    function onPatch() {
+      if (document.hidden) { pendingWhileHidden = true; return; }
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(reloadNow, 250);
+    }
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden && pendingWhileHidden) { pendingWhileHidden = false; reloadNow(); }
+    });
+    import('/@vite/client')
+      .then(function (m) {
+        var hot = m.createHotContext('/__meno-play-preview');
+        hot.on('${PLAY_PATCH_EVENT}', onPatch);
+      })
+      .catch(function () {});
+  })();
 }
 `;
